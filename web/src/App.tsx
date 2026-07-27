@@ -10,6 +10,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import type { DiffSummary } from '../../src/core/diff.js'
 import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
 import { describeProblem, describeUnreachable } from '../../src/core/problem.js'
@@ -30,12 +31,14 @@ const refusalIn = async (response: Response): Promise<string> => {
 const POLL_MS = 2000
 
 /** Node cards are rendered by ReactFlow, so the Fork action reaches them here. */
-const ForkContext = createContext<(parentId: string) => void>(() => {})
+const ForkContext = createContext<(parentId: string, intent: string) => Promise<string | null>>(
+  async () => null,
+)
 
 const NodeCard = ({ id, data }: NodeProps<GraphNode>) => {
   const onFork = useContext(ForkContext)
 
-  return <Card data={data} onFork={() => onFork(id)} />
+  return <Card data={data} onFork={(intent) => onFork(id, intent)} />
 }
 
 const nodeTypes = { nodegraph: NodeCard }
@@ -52,41 +55,70 @@ export const App = () => {
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch('/api/graph')
+      // The graph itself is nodegraph's own bookkeeping and goes unlocked so the
+      // page can draw at all; the diffs are read out of the user's own files, so
+      // that poll carries this run's key. ADR-0004.
+      const [response, measured] = await Promise.all([
+        fetch('/api/graph'),
+        fetch('/api/diffs', { headers: { [KEY_HEADER]: runKey() } }),
+      ])
       if (!response.ok) {
         setProblem(await refusalIn(response))
         return
       }
       const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
 
+      // A refused diff poll costs the numbers, not the graph — so say so, and
+      // still draw. Swallowing it would leave every card silently unmeasured.
+      if (!measured.ok) setProblem(await refusalIn(measured))
+      const { diffs } = measured.ok
+        ? ((await measured.json()) as { diffs: (DiffSummary & { nodeId: string })[] })
+        : { diffs: [] }
+      const byNode = new Map(diffs.map(({ nodeId, ...summary }) => [nodeId, summary]))
+
       // The server says what exists; the browser keeps where it sits.
-      setNodes((current) => mergeGraph(current, incoming).nodes)
+      setNodes((current) =>
+        mergeGraph(current, incoming).nodes.map((node) => ({
+          ...node,
+          data: { ...node.data, diff: byNode.get(node.id) },
+        })),
+      )
       setEdges(incoming.edges)
     } catch (cause) {
       setProblem(describeUnreachable(cause))
     }
   }, [setNodes, setEdges])
 
+  /** Returns the reason the Fork did not happen, or null when it did. */
   const onFork = useCallback(
-    (parentId: string) => {
-      void (async () => {
-        setProblem(null)
-        try {
-          const response = await fetch('/api/fork', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
-            body: JSON.stringify({ parentId }),
-          })
-          // A Fork that did not happen has to say so where the user is looking.
-          // Silence here is the whole difference between "nodegraph refused,
-          // and here is the command that fixes it" and "the button is broken".
-          if (!response.ok) setProblem(await refusalIn(response))
-        } catch (cause) {
-          setProblem(describeUnreachable(cause))
+    async (parentId: string, intent: string): Promise<string | null> => {
+      setProblem(null)
+      try {
+        const response = await fetch('/api/fork', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
+          body: JSON.stringify({ parentId, intent }),
+        })
+
+        // A Fork that did not happen has to say so where the user is looking.
+        // Silence here is the whole difference between "nodegraph refused, and
+        // here is the command that fixes it" and "the button is broken". It is
+        // said twice on purpose: on the card that was pressed, and in the
+        // banner, which survives the card being redrawn by the next poll.
+        if (!response.ok) {
+          const refusal = await refusalIn(response)
+          setProblem(refusal)
+          return refusal
         }
-        // Don't make the user wait out a poll to see what they just did.
-        await load()
-      })()
+      } catch (cause) {
+        const unreachable = describeUnreachable(cause)
+        setProblem(unreachable)
+        return unreachable
+      }
+
+      // Don't make the user wait out a poll to see what they just did.
+      await load()
+      return null
     },
     [load],
   )

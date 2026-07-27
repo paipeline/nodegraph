@@ -2,13 +2,16 @@ import { createReadStream } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { extname, join, resolve, sep } from 'node:path'
+import { readDiffs } from '../adapters/diff.js'
 import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
-import { readForks } from '../adapters/store.js'
+import { SessionSupervisor } from '../adapters/session.js'
+import { readStore, StoreCannotBeRead } from '../adapters/store.js'
 import { readWorkspaceReports } from '../adapters/workspace.js'
 import { toFlowGraph } from '../core/flow.js'
 import { KEY_META } from '../core/guard.js'
 import { reconcile } from '../core/reconcile.js'
+import { forkRefusal, readIntent } from '../core/session.js'
 import { openGate, refuseRequest, type Gate } from './gate.js'
 import { attachSessions } from './session.js'
 
@@ -151,16 +154,50 @@ const readBody = (request: IncomingMessage): Promise<string> =>
  */
 const currentNodes = async (repoPath: string) => {
   const world = await readWorld(repoPath)
+  const { forks, refusal } = await readStore(repoPath)
+  const reports = await readWorkspaceReports(world.worktrees.map((worktree) => worktree.path))
 
-  return reconcile(
-    world,
-    await readForks(repoPath),
-    await readWorkspaceReports(world.worktrees.map((worktree) => worktree.path)),
+  const nodes = reconcile(world, forks, reports)
+
+  // A store nodegraph cannot read stops every Fork, so it is said on every
+  // Node. It goes in the seat the on-fork refusal already sits in — read on
+  // every poll, written on the card, disabling the button — because that is the
+  // one path in this codebase already proven to reach the user's eyes, and a
+  // refusal the user cannot see is a Fork button that appears to be broken.
+  if (refusal === null) return nodes
+
+  return nodes.map((node) => ({ ...node, forkRefusal: refusal }))
+}
+
+/**
+ * The graph, with everything the page needs in order to draw it and to know
+ * what it may offer. Both judgements — the title a Node carries and whether it
+ * may be Forked right now — are made here, so the browser only renders them.
+ */
+const currentGraph = async (repoPath: string, agents: SessionSupervisor) => {
+  const { forks } = await readStore(repoPath)
+  // The same Nodes `/api/nodes` serves, Workspace reports and all: a Node whose
+  // environment is still landing, whose on-fork hook cannot be run, or whose
+  // store cannot be read has to say so on the card the user is looking at, not
+  // only in a route nothing polls.
+  const nodes = await currentNodes(repoPath)
+
+  return toFlowGraph(
+    nodes,
+    Object.fromEntries(
+      nodes.map((node) => [
+        node.id,
+        {
+          title: forks.find((fork) => fork.id === node.id)?.intent ?? null,
+          forkRefusal: forkRefusal(agents.activityOf(node.id)),
+        },
+      ]),
+    ),
   )
 }
 
 const handle = async (
-  options: { repoPath: string; webRoot?: string; gate: Gate },
+  options: { repoPath: string; webRoot?: string; gate: Gate; agents: SessionSupervisor },
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> => {
@@ -180,18 +217,56 @@ const handle = async (
   // Layout is a rule, not a rendering concern, so it stays here where it is
   // tested. The browser only draws what it is given.
   if (pathname === '/api/graph') {
-    json(response, 200, toFlowGraph(await currentNodes(options.repoPath)))
+    json(response, 200, await currentGraph(options.repoPath, options.agents))
+    return
+  }
+
+  // How far each Node has come, measured against the fork point recorded when
+  // it was forked. It changes nothing, but it is not a read of nodegraph's own
+  // bookkeeping either — it walks the user's working tree and reads the files
+  // in it — so it takes this run's key. See ADR-0004; the gate has already
+  // turned away anyone without one by the time we are here.
+  if (pathname === '/api/diffs') {
+    json(response, 200, { diffs: await readDiffs(options.repoPath) })
     return
   }
 
   if (pathname === '/api/fork' && request.method === 'POST') {
-    const { parentId } = JSON.parse(await readBody(request)) as { parentId?: string }
+    const { parentId, intent } = JSON.parse(await readBody(request)) as {
+      parentId?: string
+      intent?: unknown
+    }
     if (typeof parentId !== 'string') {
       json(response, 400, { error: 'Which Node should this fork from?' })
       return
     }
 
-    json(response, 201, { node: await fork({ repoPath: options.repoPath, parentId }) })
+    const reading = readIntent(typeof intent === 'string' ? intent : null)
+    if ('refusal' in reading) {
+      json(response, 400, { error: reading.refusal })
+      return
+    }
+
+    // ADR-0002: only at a rest point. Answered here as well as drawn on the
+    // page, because a page that has not polled for two seconds would otherwise
+    // let the user Fork a Context caught mid-thought.
+    const refusal = forkRefusal(options.agents.activityOf(parentId))
+    if (refusal !== null) {
+      json(response, 409, { error: refusal })
+      return
+    }
+
+    try {
+      json(response, 201, {
+        node: await fork({ repoPath: options.repoPath, parentId, intent: reading.intent }),
+      })
+    } catch (cause) {
+      // Not a crash: nodegraph is refusing, on purpose, to write over the one
+      // file that says which Node came from which. Answered like the other
+      // refusals so the page prints the sentence instead of a stack trace.
+      if (!(cause instanceof StoreCannotBeRead)) throw cause
+      json(response, 409, { error: cause.message })
+    }
     return
   }
 
@@ -211,7 +286,7 @@ export const startServer = async (options: {
   webRoot?: string
 }): Promise<RunningServer> => {
   const server = createServer((request, response) => {
-    handle({ ...options, gate }, request, response).catch((error: unknown) => {
+    handle({ ...options, gate, agents }, request, response).catch((error: unknown) => {
       json(response, 500, { error: error instanceof Error ? error.message : String(error) })
     })
   })
@@ -220,7 +295,11 @@ export const startServer = async (options: {
   // something is listening — which is exactly when the first request arrives.
   const gate = openGate(server)
 
-  const sessions = attachSessions(server, options.repoPath, gate)
+  // One supervisor for the whole run: the socket puts a viewer in front of an
+  // agent, and the Fork route asks the same supervisor whether that agent has
+  // stopped. Two of them would disagree about what is running.
+  const agents = new SessionSupervisor(options.repoPath)
+  const sessions = attachSessions(server, options.repoPath, gate, agents)
 
   await new Promise<void>((resolve) => {
     server.listen(options.port ?? 0, '127.0.0.1', resolve)

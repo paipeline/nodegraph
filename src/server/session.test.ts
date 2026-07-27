@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'ws'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { SESSION_PROTOCOL, toKeyProtocol } from '../core/guard.js'
+import { KEY_HEADER, SESSION_PROTOCOL, toKeyProtocol } from '../core/guard.js'
 import { startServer } from './server.js'
 
 /**
@@ -12,13 +12,51 @@ import { startServer } from './server.js'
  * so these tests never reach a model, an account or the network. It answers
  * `size` with what the tty reports, which is how we can see the terminal the
  * agent believes it is running in.
+ *
+ * It also keeps its Contexts where the real one does — a file per session under
+ * the claude home, filed by the directory it was run in (ADR-0005) — and it
+ * refuses to resume one that was never made, exactly as the real one does. That
+ * is what lets a Fork's inheritance be watched through the socket the browser
+ * uses, rather than only asserted underneath it.
  */
 const FAKE_CLAUDE = `#!/bin/sh
-printf 'ARGV[%s]\\n' "$*"
-printf 'CWD[%s]\\n' "$(pwd -P)"
+argv="$*"
+here=$(pwd -P)
+home="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+dir="$home/projects/$(printf '%s' "$here" | tr '/._' '---')"
+id=''
+resume=no
+prompt=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) id="$2"; shift 2 ;;
+    --resume) id="$2"; resume=yes; shift 2 ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+file="$dir/$id.jsonl"
+if [ "$resume" = yes ] && [ ! -f "$file" ]; then
+  printf 'No conversation found with session ID: %s\\n' "$id"
+  exit 1
+fi
+say() {
+  printf '{"sessionId":"%s","cwd":"%s","said":"%s"}\\n' "$id" "$here" "$1" >> "$file"
+}
+printf 'ARGV[%s]\\n' "$argv"
+printf 'CWD[%s]\\n' "$here"
+mkdir -p "$dir"
+if [ -n "$prompt" ]; then say "$prompt"; fi
+if [ -f "$file" ]; then printf 'CTX[%s]\\n' "$(tr '\\n' '|' < "$file")"; else printf 'CTX[]\\n'; fi
 while IFS= read -r line; do
   if [ "$line" = "quit" ]; then exit 7; fi
   if [ "$line" = "size" ]; then printf 'SIZE[%s]\\n' "$(stty size)"; continue; fi
+  if [ "$line" = "work" ]; then
+    i=0
+    while [ $i -lt 30 ]; do printf '.'; sleep 0.05; i=$((i+1)); done
+    printf 'DONE\\n'
+    continue
+  fi
+  say "$line"
   printf 'HEARD[%s]\\n' "$line"
 done
 `
@@ -27,7 +65,9 @@ type Frame = { type: string; [key: string]: unknown }
 
 let sandbox: string
 let repo: string
+let claudeHome: string
 let originalPath: string | undefined
+let originalClaudeHome: string | undefined
 let url: string
 let key: string
 let stop: (() => Promise<void>) | undefined
@@ -36,8 +76,14 @@ const opened: WebSocket[] = []
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
+/**
+ * How long to give a real pty to say something, not how long to wait for it —
+ * `waitFor` returns the moment the check holds. The ceiling is generous
+ * because every file in this suite runs at once, each with real ptys and real
+ * git in it: a short ceiling here does not catch bugs, it just fails under load.
+ */
 const settle = async (check: () => void): Promise<void> =>
-  vi.waitFor(check, { timeout: 4_000, interval: 20 })
+  vi.waitFor(check, { timeout: 15_000, interval: 20 })
 
 /** A viewer, the way a browser tab is a viewer — key and all. */
 const view = (nodeId: string) => {
@@ -65,6 +111,18 @@ const view = (nodeId: string) => {
   }
 }
 
+/** Forking changes the world, so it takes the key — as it does from the page. */
+const forkFrom = (parentId: string, intent?: string) =>
+  fetch(`${url}/api/fork`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', [KEY_HEADER]: key },
+    body: JSON.stringify({ parentId, intent }),
+  })
+
+const graph = async (): Promise<{
+  nodes: { id: string; data: { title?: string | null; forkRefusal?: string | null } }[]
+}> => (await fetch(`${url}/api/graph`)).json() as never
+
 beforeEach(async () => {
   sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-ws-')))
 
@@ -74,6 +132,12 @@ beforeEach(async () => {
   chmodSync(join(bin, 'claude'), 0o755)
   originalPath = process.env.PATH
   process.env.PATH = `${bin}:${originalPath ?? ''}`
+
+  // Contexts land here rather than in the person's own claude home.
+  claudeHome = join(sandbox, 'claude-home')
+  mkdirSync(claudeHome)
+  originalClaudeHome = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = claudeHome
 
   repo = join(sandbox, 'repo')
   mkdirSync(repo)
@@ -94,6 +158,8 @@ afterEach(async () => {
   for (const socket of opened.splice(0)) socket.terminate()
   await stop?.()
   process.env.PATH = originalPath
+  if (originalClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeHome
   rmSync(sandbox, { recursive: true, force: true })
 })
 
@@ -175,5 +241,138 @@ describe('the terminal behind a Node', () => {
 
     await settle(() => expect(viewer.frames[0]).toMatchObject({ type: 'error' }))
     await settle(() => expect(viewer.socket.readyState).toBe(WebSocket.CLOSED))
+  })
+
+  /**
+   * The other place a Workspace becomes the directory a process is started in.
+   * `graph.json` sits in the user's repository, so it can name anywhere; a Node
+   * is only ever a directory git listed as a worktree of this repository, so a
+   * record naming anywhere else opens no terminal — not even wearing the
+   * Trunk's own name, which every graph has and so is the easiest one to wear.
+   */
+  it('opens an agent only in a Workspace git has, whatever the store says', async () => {
+    const elsewhere = join(sandbox, 'elsewhere')
+    mkdirSync(elsewhere)
+    mkdirSync(join(repo, '.nodegraph'), { recursive: true })
+    const borrowed = {
+      parentId: 'trunk',
+      workspacePath: elsewhere,
+      forkPointSha: git(repo, 'rev-parse', 'HEAD'),
+      createdAt: '2026-07-27T09:00:00.000Z',
+    }
+    writeFileSync(
+      join(repo, '.nodegraph', 'graph.json'),
+      JSON.stringify({
+        forks: [
+          { ...borrowed, id: 'trunk', branch: 'nodegraph/trunk' },
+          { ...borrowed, id: 'a1b2c3d4', branch: 'nodegraph/a1b2c3d4' },
+        ],
+      }),
+    )
+
+    const stranger = view('a1b2c3d4')
+    await settle(() => expect(stranger.frames[0]).toMatchObject({ type: 'error' }))
+
+    const trunk = view('trunk')
+    await settle(() => expect(trunk.screen()).toContain(`CWD[${repo}]`))
+    expect(trunk.screen()).not.toContain(elsewhere)
+  })
+})
+
+describe('the line written when a Node is Forked', () => {
+  it('becomes that Node’s title on the graph', async () => {
+    const forked = await forkFrom('trunk', '  try it with a   queue instead ')
+    expect(forked.status).toBe(201)
+    const { node } = (await forked.json()) as { node: { id: string } }
+
+    const drawn = await graph()
+
+    expect(drawn.nodes.find((candidate) => candidate.id === node.id)?.data.title).toBe(
+      'try it with a queue instead',
+    )
+    expect(drawn.nodes.find((candidate) => candidate.id === 'trunk')?.data.title).toBeNull()
+  })
+
+  it('is refused when claude would read it as a flag rather than as words', async () => {
+    const refused = await forkFrom('trunk', '--dangerously-skip-permissions')
+
+    expect(refused.status).toBe(400)
+    expect((await refused.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining('flag'),
+    })
+    expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+  })
+})
+
+describe('the understanding a Forked Node opens with', () => {
+  it('is everything the parent had worked out, and none of what it said afterwards', async () => {
+    const parent = view('trunk')
+    await settle(() => expect(parent.screen()).toContain('CWD['))
+    parent.send({ type: 'input', data: 'the-api-key-lives-in-vault\r' })
+    await settle(() => expect(parent.screen()).toContain('HEARD[the-api-key-lives-in-vault]'))
+
+    // ADR-0002: the Fork waits until the agent has stopped for the user, so
+    // this is the click the user gets to make, not one we sneak in early.
+    const forked = await vi.waitFor(
+      async () => {
+        const response = await forkFrom('trunk', 'try a queue instead')
+        expect(response.status).toBe(201)
+        return response
+      },
+      { timeout: 20_000, interval: 100 },
+    )
+    const { node } = (await forked.json()) as { node: { id: string } }
+
+    // The parent goes on thinking. None of this is the child's.
+    parent.send({ type: 'input', data: 'SAID-AFTER-THE-FORK\r' })
+    await settle(() => expect(parent.screen()).toContain('HEARD[SAID-AFTER-THE-FORK]'))
+
+    const child = view(node.id)
+    await settle(() => expect(child.screen()).toContain('CTX['))
+
+    expect(child.screen()).toContain('the-api-key-lives-in-vault')
+    expect(child.screen()).not.toContain('SAID-AFTER-THE-FORK')
+    expect(child.screen()).toContain('try a queue instead')
+
+    // And what the child works out never travels back up.
+    child.send({ type: 'input', data: 'THE-CHILD-WORKED-THIS-OUT\r' })
+    await settle(() => expect(child.screen()).toContain('HEARD[THE-CHILD-WORKED-THIS-OUT]'))
+    expect(parent.screen()).not.toContain('THE-CHILD-WORKED-THIS-OUT')
+  })
+})
+
+describe('Forking a Node whose agent is at work', () => {
+  it('holds the Fork back with a reason, and lets it through once the agent stops', async () => {
+    const viewer = view('trunk')
+    await settle(() => expect(viewer.screen()).toContain('CWD['))
+
+    viewer.send({ type: 'input', data: 'work\r' })
+    // The fake claude paints while it works, the way the real one does.
+    await settle(() => expect(viewer.screen()).toContain('....'))
+
+    const refused = await forkFrom('trunk')
+    expect(refused.status).toBe(409)
+    expect((await refused.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining('still working'),
+    })
+
+    // Refused means nothing happened at all — no half-built Workspace.
+    expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+
+    // The page is told the same thing, so the entry can be disabled with the
+    // reason on it rather than failing under the user's hand.
+    const busy = await graph()
+    expect(busy.nodes[0]?.data.forkRefusal).toContain('still working')
+
+    // And once the agent stops for the user, the very same Fork goes through.
+    const allowed = await vi.waitFor(
+      async () => {
+        const response = await forkFrom('trunk')
+        expect(response.status).toBe(201)
+        return response
+      },
+      { timeout: 20_000, interval: 100 },
+    )
+    expect(allowed.status).toBe(201)
   })
 })

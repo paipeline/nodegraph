@@ -534,4 +534,28 @@ describe('provisioning a Workspace', () => {
       expect(git(repo, 'worktree', 'list', '--porcelain')).not.toContain(workspacePath)
     },
   )
+
+  /**
+   * `-b <branch>` is the one argument git reads twice: `git worktree add` takes
+   * the value and hands it on to be parsed as `git branch`'s own arguments, so
+   * a branch named `-m` renames the repository's branch out from under it and a
+   * `-d` tries to delete one. Nothing before it stops that — `--end-of-options`
+   * placed after `-b` is already too late.
+   *
+   * The branch is nodegraph's own name for a Node today, but Discard will read
+   * it back out of the store, which is a file in the user's repository. So the
+   * name is made a branch first, on its own, where git will only read it as a
+   * name — and the Fork stops rather than doing whatever the name says.
+   */
+  it('refuses a branch name git would read as an instruction, and touches nothing', async () => {
+    const workspacePath = join(repo, 'child')
+
+    for (const branch of ['-m', '-d', '--all', '-D']) {
+      await expect(provisionWorkspace({ from: repo, workspacePath, branch })).rejects.toThrow()
+    }
+
+    expect(git(repo, 'branch', '--format=%(refname:short)')).toBe('main')
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(firstCommit)
+    expect(existsSync(workspacePath)).toBe(false)
+  })
 })

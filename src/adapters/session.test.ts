@@ -1,8 +1,18 @@
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { contextPath } from '../core/context.js'
+import { forkRecord, workspaceOf } from '../core/store.js'
 import { SessionSupervisor } from './session.js'
+import { homeOf, readSessions, recordFork } from './store.js'
+
+const PARENT_SESSION = '99999999-8888-7777-6666-555555555555'
+const CHILD_SESSION = '11111111-2222-3333-4444-555555555555'
+/** The name nodegraph gives a Node — eight hex digits, and nothing else. */
+const CHILD_ID = 'c41d0e5f'
+/** Another Node's name, for the pair of tests about two agents at once. */
+const OTHER_ID = '0f5ec001'
 
 /**
  * Everything here is driven by a fake `claude` on PATH: it reports the
@@ -19,8 +29,11 @@ done
 `
 
 let sandbox: string
+let repo: string
 let workspace: string
+let claudeHome: string
 let originalPath: string | undefined
+let originalClaudeHome: string | undefined
 let supervisor: SessionSupervisor
 
 const settle = async (check: () => void): Promise<void> =>
@@ -34,32 +47,50 @@ beforeEach(() => {
   writeFileSync(join(bin, 'claude'), FAKE_CLAUDE)
   chmodSync(join(bin, 'claude'), 0o755)
 
-  workspace = join(sandbox, 'workspace')
-  mkdirSync(workspace)
+  repo = join(sandbox, 'repo')
+  mkdirSync(repo)
+  // Where nodegraph would actually have put this Node's Workspace, because
+  // that is what `core/store` recomputes and compares when it reads a record
+  // back — a Workspace anywhere else is a record nodegraph did not write.
+  workspace = workspaceOf(homeOf(repo), CHILD_ID)
+  mkdirSync(workspace, { recursive: true })
 
   originalPath = process.env.PATH
   process.env.PATH = `${bin}:${originalPath ?? ''}`
 
-  supervisor = new SessionSupervisor()
+  // Contexts are looked for here, never in the person's own claude home.
+  claudeHome = join(sandbox, 'claude-home')
+  mkdirSync(claudeHome)
+  originalClaudeHome = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = claudeHome
+
+  supervisor = new SessionSupervisor(repo)
 })
 
 afterEach(() => {
   supervisor.stopAll()
   process.env.PATH = originalPath
+  if (originalClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeHome
   rmSync(sandbox, { recursive: true, force: true })
 })
 
 describe('opening a session on a Node', () => {
-  it('runs the claude on PATH inside that Node’s Workspace, adding no arguments of its own', async () => {
-    const session = supervisor.open('trunk', workspace)
+  it('runs the claude on PATH inside that Node’s Workspace, in a Context it writes down', async () => {
+    const session = await supervisor.open('trunk', workspace)
 
     await settle(() => expect(session.scrollback()).toContain('CWD['))
-    expect(session.scrollback()).toContain('ARGV[]')
     expect(session.scrollback()).toContain(`CWD[${workspace}]`)
+
+    // The Context the agent was actually given is the one the store now names,
+    // or nodegraph could never find its way back to this conversation.
+    const [recorded] = await readSessions(repo)
+    expect(recorded?.nodeId).toBe('trunk')
+    expect(session.scrollback()).toContain(`ARGV[--session-id ${recorded?.sessionId ?? ''}]`)
   })
 
   it('delivers what the user types through to the agent', async () => {
-    const session = supervisor.open('trunk', workspace)
+    const session = await supervisor.open('trunk', workspace)
     await settle(() => expect(session.scrollback()).toContain('CWD['))
 
     session.write('permission granted\r')
@@ -68,12 +99,12 @@ describe('opening a session on a Node', () => {
   })
 
   it('hands a later opener the agent that is already running, history and all', async () => {
-    const first = supervisor.open('trunk', workspace)
+    const first = await supervisor.open('trunk', workspace)
     await settle(() => expect(first.scrollback()).toContain('CWD['))
     first.write('before the reload\r')
     await settle(() => expect(first.scrollback()).toContain('HEARD[before the reload]'))
 
-    const reopened = supervisor.open('trunk', workspace)
+    const reopened = await supervisor.open('trunk', workspace)
 
     expect(reopened.scrollback()).toContain('HEARD[before the reload]')
 
@@ -84,7 +115,7 @@ describe('opening a session on a Node', () => {
   })
 
   it('reports the agent as finished, with the code it exited on', async () => {
-    const session = supervisor.open('trunk', workspace)
+    const session = await supervisor.open('trunk', workspace)
     await settle(() => expect(session.scrollback()).toContain('CWD['))
 
     expect(session.status()).toEqual({ state: 'running' })
@@ -95,13 +126,188 @@ describe('opening a session on a Node', () => {
   })
 })
 
+describe('opening a session on a Node that was Forked from another', () => {
+  /** The Context the Fork already placed for this Node, as claude keeps them. */
+  const placeContext = (sessionId: string, said: string): void => {
+    const path = contextPath(claudeHome, workspace, sessionId)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, `${JSON.stringify({ type: 'user', sessionId, said })}\n`)
+  }
+
+  const recordChild = () =>
+    recordFork(
+      repo,
+      forkRecord({
+        id: CHILD_ID,
+        parentId: 'trunk',
+        home: homeOf(repo),
+        forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+        createdAt: '2026-07-27T09:01:00.000Z',
+        sessionId: CHILD_SESSION,
+        parentSessionId: PARENT_SESSION,
+        intent: 'try it with a queue instead',
+      }),
+    )
+
+  it('opens the Context the Fork already cut for it, on the line the Fork was given', async () => {
+    await recordChild()
+    // The Fork put the parent's understanding here, under the child's own name,
+    // at the moment it was taken — see ADR-0004.
+    placeContext(CHILD_SESSION, 'the-api-key-lives-in-vault')
+
+    const session = await supervisor.open(CHILD_ID, workspace)
+
+    await settle(() => expect(session.scrollback()).toContain('CWD['))
+    expect(session.scrollback()).toContain(
+      `ARGV[--resume ${CHILD_SESSION} try it with a queue instead]`,
+    )
+    // Never the parent's: claude looks for a Context only in the directory it
+    // is run from, and the parent's is in a different Workspace entirely.
+    expect(session.scrollback()).not.toContain(PARENT_SESSION)
+    expect(session.scrollback()).not.toContain('--fork-session')
+  })
+
+  it('resumes the Context that Node has since built up, rather than cutting it from the parent twice', async () => {
+    await recordChild()
+    placeContext(CHILD_SESSION, 'the-api-key-lives-in-vault')
+
+    const first = await supervisor.open(CHILD_ID, workspace)
+    await settle(() => expect(first.scrollback()).toContain('CWD['))
+    supervisor.stopAll()
+
+    // A second nodegraph, or the same one tomorrow: the Node's own Context is
+    // the one it goes back to, and the line it was Forked on is not said again.
+    const later = new SessionSupervisor(repo)
+    const reopened = await later.open(CHILD_ID, workspace)
+    await settle(() => expect(reopened.scrollback()).toContain('CWD['))
+    later.stopAll()
+
+    expect(reopened.scrollback()).toContain(`ARGV[--resume ${CHILD_SESSION}]`)
+    expect(reopened.scrollback()).not.toContain('--fork-session')
+  })
+
+  it('opens a Fork recorded before nodegraph carried Contexts, in a Context of its own', async () => {
+    // Exactly what an older nodegraph wrote: a Fork with no Context named on it.
+    await recordFork(
+      repo,
+      forkRecord({
+        id: CHILD_ID,
+        parentId: 'trunk',
+        home: homeOf(repo),
+        forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+        createdAt: '2026-07-27T09:01:00.000Z',
+      }),
+    )
+
+    const session = await supervisor.open(CHILD_ID, workspace)
+
+    await settle(() => expect(session.scrollback()).toContain('CWD['))
+    expect(session.scrollback()).not.toContain('--resume')
+
+    const [recorded] = await readSessions(repo)
+    expect(recorded?.nodeId).toBe(CHILD_ID)
+    expect(session.scrollback()).toContain(`ARGV[--session-id ${recorded?.sessionId ?? ''}]`)
+  })
+
+  /**
+   * The store is a file in the user's repository, so what it says about a Node
+   * is not what nodegraph said about it — it is whatever is on that disk now.
+   * These are the two fields of a Fork record that end up in a real `claude`'s
+   * argv, and `--dangerously-skip-permissions` is a real flag of claude's that
+   * turns every permission check off in the directory it runs in.
+   */
+  it('never hands claude a flag off the store, however the record spells it', async () => {
+    for (const hostile of [
+      { intent: '--dangerously-skip-permissions' },
+      { sessionId: '--dangerously-skip-permissions' },
+      { parentSessionId: '--dangerously-skip-permissions' },
+    ]) {
+      // Written past the store's own front door, exactly as a hand-edit, a bad
+      // merge or a graph.json committed to a repository would arrive.
+      mkdirSync(homeOf(repo), { recursive: true })
+      writeFileSync(
+        join(homeOf(repo), 'graph.json'),
+        JSON.stringify({
+          forks: [
+            {
+              ...forkRecord({
+                id: CHILD_ID,
+                parentId: 'trunk',
+                home: homeOf(repo),
+                forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+                createdAt: '2026-07-27T09:01:00.000Z',
+                sessionId: CHILD_SESSION,
+              }),
+              ...hostile,
+            },
+          ],
+        }),
+      )
+
+      const supervisorNow = new SessionSupervisor(repo)
+      const session = await supervisorNow.open(CHILD_ID, workspace)
+      await settle(() => expect(session.scrollback()).toContain('CWD['))
+      supervisorNow.stopAll()
+
+      expect(session.scrollback()).not.toContain('--dangerously-skip-permissions')
+    }
+  })
+
+  it('never hands claude a Context name that would walk out of claude’s home', async () => {
+    mkdirSync(homeOf(repo), { recursive: true })
+    writeFileSync(
+      join(homeOf(repo), 'graph.json'),
+      JSON.stringify({
+        forks: [
+          {
+            ...forkRecord({
+              id: CHILD_ID,
+              parentId: 'trunk',
+              home: homeOf(repo),
+              forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+              createdAt: '2026-07-27T09:01:00.000Z',
+            }),
+            sessionId: '../../../../../../etc/passwd',
+          },
+        ],
+      }),
+    )
+
+    const supervisorNow = new SessionSupervisor(repo)
+    const session = await supervisorNow.open(CHILD_ID, workspace)
+    await settle(() => expect(session.scrollback()).toContain('CWD['))
+    supervisorNow.stopAll()
+
+    expect(session.scrollback()).not.toContain('..')
+    // What it gets instead is a Context of its own, named the way nodegraph
+    // names one — the Node still opens, it just does not obey the file.
+    expect(session.scrollback()).toMatch(
+      /ARGV\[--session-id [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\]/,
+    )
+  })
+
+  it('gives two viewers who arrive together one agent, not one each', async () => {
+    const [first, second] = await Promise.all([
+      supervisor.open('trunk', workspace),
+      supervisor.open('trunk', workspace),
+    ])
+
+    await settle(() => expect(first?.scrollback()).toContain('CWD['))
+    second?.write('only one of you should hear this\r')
+
+    await settle(() =>
+      expect(first?.scrollback()).toContain('HEARD[only one of you should hear this]'),
+    )
+  })
+})
+
 describe('sessions on different Nodes', () => {
   it('run in their own Workspace and never hear each other', async () => {
     const otherWorkspace = join(sandbox, 'other-workspace')
     mkdirSync(otherWorkspace)
 
-    const here = supervisor.open('trunk', workspace)
-    const there = supervisor.open('fork-of-trunk', otherWorkspace)
+    const here = await supervisor.open('trunk', workspace)
+    const there = await supervisor.open(OTHER_ID, otherWorkspace)
 
     await settle(() => {
       expect(here.scrollback()).toContain(`CWD[${workspace}]`)
@@ -119,8 +325,8 @@ describe('sessions on different Nodes', () => {
     const otherWorkspace = join(sandbox, 'other-workspace')
     mkdirSync(otherWorkspace)
 
-    const here = supervisor.open('trunk', workspace)
-    const there = supervisor.open('fork-of-trunk', otherWorkspace)
+    const here = await supervisor.open('trunk', workspace)
+    const there = await supervisor.open(OTHER_ID, otherWorkspace)
     await settle(() => {
       expect(here.scrollback()).toContain('CWD[')
       expect(there.scrollback()).toContain('CWD[')

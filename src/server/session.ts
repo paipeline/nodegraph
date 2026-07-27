@@ -49,8 +49,8 @@ export const attachSessions = (
   server: Server,
   repoPath: string,
   gate: Gate,
+  supervisor: SessionSupervisor,
 ): { close: () => void } => {
-  const supervisor = new SessionSupervisor()
   const websockets = new WebSocketServer({
     noServer: true,
     // The key arrives as one of the offered subprotocols, so always answer
@@ -67,7 +67,7 @@ export const attachSessions = (
 
     if (node === undefined) return refuse(socket, `No Node named ${nodeId}`)
 
-    const session = supervisor.open(node.id, node.workspacePath)
+    const session = await supervisor.open(node.id, node.workspacePath)
 
     send(socket, {
       type: 'opened',

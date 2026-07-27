@@ -180,4 +180,36 @@ describe('reconcile', () => {
 
     expect(nodes.map((node) => node.id)).toEqual(['trunk'])
   })
+
+  /**
+   * Every Workspace on a Node here is a directory the world reported, so
+   * everything downstream that starts a process in one — measuring a diff,
+   * opening an agent — is starting it somewhere git says belongs to this
+   * repository. A record naming somewhere else is not drawn, and so cannot be
+   * measured or opened, whatever name it is wearing.
+   */
+  it('draws no Node in a directory the world does not have, however it is named', () => {
+    const world = snapshot([
+      { path: '/repo', branch: 'main', isPrimary: true },
+      { path: '/repo/.nodegraph/workspaces/abc', branch: 'nodegraph/abc', isPrimary: false },
+    ])
+    const real = {
+      id: 'abc',
+      parentId: 'trunk',
+      workspacePath: '/repo/.nodegraph/workspaces/abc',
+      forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+    }
+    const elsewhere = '/elsewhere/vendor/somedep'
+
+    const nodes = reconcile(world, [
+      real,
+      { ...real, workspacePath: elsewhere },
+      { ...real, id: 'trunk', workspacePath: elsewhere },
+    ])
+
+    expect(nodes.map((node) => node.workspacePath)).toEqual([
+      '/repo',
+      '/repo/.nodegraph/workspaces/abc',
+    ])
+  })
 })
