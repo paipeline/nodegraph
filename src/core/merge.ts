@@ -1,0 +1,37 @@
+/**
+ * Folds a freshly polled graph into what is already on screen.
+ *
+ * The server owns *what exists* and *what it says*; the browser owns *where it
+ * sits* and *what is selected*. Without this, every poll would throw away the
+ * user's dragging and selection two seconds after they did it.
+ *
+ * Generic over the node type so the browser can hand it ReactFlow's own nodes
+ * without a cast at the boundary.
+ */
+
+export type Positioned = {
+  id: string
+  position: { x: number; y: number }
+  selected?: boolean
+}
+
+export const mergeGraph = <N extends Positioned, E>(
+  onScreen: N[],
+  incoming: { nodes: N[]; edges: E[] },
+): { nodes: N[]; edges: E[] } => {
+  const existing = new Map(onScreen.map((node) => [node.id, node]))
+
+  return {
+    nodes: incoming.nodes.map((node) => {
+      const previous = existing.get(node.id)
+      if (previous === undefined) return node
+
+      return {
+        ...node,
+        position: previous.position,
+        ...(previous.selected === undefined ? {} : { selected: previous.selected }),
+      }
+    }),
+    edges: incoming.edges,
+  }
+}

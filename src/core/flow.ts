@@ -15,6 +15,8 @@ export type FlowNode = {
     branch: string | null
     workspacePath: string
   }
+  /** Owned by the browser, never by the server. */
+  selected?: boolean
 }
 
 export type FlowEdge = {
