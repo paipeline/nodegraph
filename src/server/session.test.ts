@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'ws'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { SESSION_PROTOCOL, toKeyProtocol } from '../core/guard.js'
 import { startServer } from './server.js'
 
 /**
@@ -28,6 +29,7 @@ let sandbox: string
 let repo: string
 let originalPath: string | undefined
 let url: string
+let key: string
 let stop: (() => Promise<void>) | undefined
 const opened: WebSocket[] = []
 
@@ -37,9 +39,12 @@ const git = (cwd: string, ...args: string[]) =>
 const settle = async (check: () => void): Promise<void> =>
   vi.waitFor(check, { timeout: 4_000, interval: 20 })
 
-/** A viewer, the way a browser tab is a viewer. */
+/** A viewer, the way a browser tab is a viewer — key and all. */
 const view = (nodeId: string) => {
-  const socket = new WebSocket(`${url.replace(/^http/, 'ws')}/session?node=${nodeId}`)
+  const socket = new WebSocket(`${url.replace(/^http/, 'ws')}/session?node=${nodeId}`, [
+    SESSION_PROTOCOL,
+    toKeyProtocol(key),
+  ])
   opened.push(socket)
 
   const frames: Frame[] = []
@@ -81,6 +86,7 @@ beforeEach(async () => {
 
   const server = await startServer({ repoPath: repo, port: 0 })
   url = server.url
+  key = server.key
   stop = server.close
 })
 

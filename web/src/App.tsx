@@ -10,7 +10,9 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { createContext, useCallback, useContext, useEffect } from 'react'
+import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
+import { runKey } from './key.js'
 import { Session } from './Session.js'
 
 export type NodeData = {
@@ -65,7 +67,7 @@ export const App = () => {
       void (async () => {
         await fetch('/api/fork', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
           body: JSON.stringify({ parentId }),
         })
         // Don't make the user wait out a poll to see what they just did.

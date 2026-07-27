@@ -3,14 +3,24 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { KEY_HEADER } from '../core/guard.js'
 import { startServer } from './server.js'
 
 let repo: string
 let stop: (() => Promise<void>) | undefined
 let url: string
+let key: string
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+
+/** Forking changes the world, so it takes the key — as it does from the page. */
+const forkFrom = (parentId: string) =>
+  fetch(`${url}/api/fork`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', [KEY_HEADER]: key },
+    body: JSON.stringify({ parentId }),
+  })
 
 beforeEach(async () => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-server-')))
@@ -23,6 +33,7 @@ beforeEach(async () => {
 
   const server = await startServer({ repoPath: repo, port: 0 })
   url = server.url
+  key = server.key
   stop = server.close
 })
 
@@ -91,11 +102,7 @@ describe('the local server', () => {
   })
 
   it('forks a Node, and the graph shows the child and the edge to it straight away', async () => {
-    const forked = await fetch(`${url}/api/fork`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ parentId: 'trunk' }),
-    })
+    const forked = await forkFrom('trunk')
 
     expect(forked.status).toBe(201)
     const { node } = (await forked.json()) as { node: { id: string; forkPointSha: string } }
@@ -112,11 +119,7 @@ describe('the local server', () => {
   })
 
   it('still knows where a Fork came from after nodegraph is shut down and started again', async () => {
-    const forked = await fetch(`${url}/api/fork`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ parentId: 'trunk' }),
-    })
+    const forked = await forkFrom('trunk')
     const { node } = (await forked.json()) as { node: { id: string; forkPointSha: string } }
 
     await stop?.()

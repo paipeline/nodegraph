@@ -54,6 +54,25 @@ describe('running nodegraph in a directory', () => {
     expect(lines.join('\n')).toContain(server.url)
   })
 
+  it('never prints this run’s key, or opens a browser at a url carrying it', async () => {
+    const lines: string[] = []
+    const opened: string[] = []
+    const server = await run({
+      cwd: repo,
+      port: 0,
+      open: (url) => opened.push(url),
+      log: (line) => lines.push(line),
+    })
+    stop = server.close
+
+    // A console scrolls into a screen recording, a terminal buffer and a bug
+    // report; a url goes to the browser's history and to every Referer after
+    // it. The page is served the key, and that is the only place it goes.
+    expect(server.key).not.toBe('')
+    expect(lines.join('\n')).not.toContain(server.key)
+    expect(opened.join('\n')).not.toContain(server.key)
+  })
+
   it('refuses to start outside a git repository, and starts nothing', async () => {
     const notARepo = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-cli-bare-')))
     const opened: string[] = []

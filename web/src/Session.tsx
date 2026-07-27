@@ -2,6 +2,8 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { useEffect, useRef, useState } from 'react'
+import { SESSION_PROTOCOL, toKeyProtocol } from '../../src/core/guard.js'
+import { runKey } from './key.js'
 
 /**
  * The real claude TUI for one Node, in a real pty on the other end.
@@ -65,7 +67,13 @@ export const Session = ({ nodeId, label }: { nodeId: string; label: string }) =>
     terminal.loadAddon(fit)
     terminal.open(element)
 
-    const socket = new WebSocket(socketUrl(nodeId))
+    // The browser will not let us put a header on a handshake, but it will
+    // carry the subprotocols we say we speak — so the key travels there rather
+    // than in the url, which would leave it in logs and in history.
+    const socket = new WebSocket(socketUrl(nodeId), [
+      SESSION_PROTOCOL,
+      toKeyProtocol(runKey()),
+    ])
 
     // A TUI draws itself to fit, so the pty has to be told the size of the box
     // it is actually being drawn in — on open, and every time the box changes.

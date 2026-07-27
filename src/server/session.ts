@@ -3,7 +3,9 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { readWorld } from '../adapters/git.js'
 import { SessionSupervisor } from '../adapters/session.js'
 import { readForks } from '../adapters/store.js'
+import { SESSION_PROTOCOL } from '../core/guard.js'
 import { reconcile } from '../core/reconcile.js'
+import { refuseUpgrade, type Gate } from './gate.js'
 
 /**
  * Puts a browser tab in front of a Node's agent.
@@ -46,9 +48,16 @@ const parse = (raw: string): Incoming | undefined => {
 export const attachSessions = (
   server: Server,
   repoPath: string,
+  gate: Gate,
 ): { close: () => void } => {
   const supervisor = new SessionSupervisor()
-  const websockets = new WebSocketServer({ noServer: true })
+  const websockets = new WebSocketServer({
+    noServer: true,
+    // The key arrives as one of the offered subprotocols, so always answer
+    // with the plain one — a handshake that echoed the key back would write it
+    // into every proxy log between here and the page.
+    handleProtocols: (offered) => (offered.has(SESSION_PROTOCOL) ? SESSION_PROTOCOL : false),
+  })
 
   const welcome = async (socket: WebSocket, nodeId: string | null): Promise<Viewer> => {
     if (nodeId === null) return refuse(socket, 'Ask for a Node by id')
@@ -91,6 +100,15 @@ export const attachSessions = (
     const { pathname, searchParams } = new URL(request.url ?? '/', 'http://127.0.0.1')
     if (pathname !== SESSION_PATH) {
       socket.destroy()
+      return
+    }
+
+    // Nothing about a websocket is same-origin by default: the browser will
+    // happily carry any page's upgrade to us. Judge it before there is a pty
+    // on the other end of it.
+    const verdict = gate.judge(request, 'websocket')
+    if (!verdict.allowed) {
+      refuseUpgrade(socket, verdict.reason)
       return
     }
 
