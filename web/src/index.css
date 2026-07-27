@@ -6,6 +6,7 @@
   --text: #e6e9ef;
   --muted: #8b93a3;
   --trunk: #5b8dee;
+  --fork: #8b6ce8;
   color-scheme: dark;
 }
 
@@ -62,6 +63,32 @@ body {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--trunk);
+}
+
+.card--fork {
+  border-left-color: var(--fork);
+}
+
+.card--fork .card__kind {
+  color: var(--fork);
+}
+
+.card__fork {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.card__fork:hover {
+  border-color: var(--trunk);
+  color: var(--text);
 }
 
 .card__label {

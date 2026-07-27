@@ -2,6 +2,7 @@ import type { Server } from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { readWorld } from '../adapters/git.js'
 import { SessionSupervisor } from '../adapters/session.js'
+import { readForks } from '../adapters/store.js'
 import { reconcile } from '../core/reconcile.js'
 
 /**
@@ -52,7 +53,7 @@ export const attachSessions = (
   const welcome = async (socket: WebSocket, nodeId: string | null): Promise<Viewer> => {
     if (nodeId === null) return refuse(socket, 'Ask for a Node by id')
 
-    const nodes = reconcile(await readWorld(repoPath))
+    const nodes = reconcile(await readWorld(repoPath), await readForks(repoPath))
     const node = nodes.find((candidate) => candidate.id === nodeId)
 
     if (node === undefined) return refuse(socket, `No Node named ${nodeId}`)
