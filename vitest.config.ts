@@ -13,5 +13,12 @@ export default defineConfig({
       '**/.nodegraph/**',
       '**/.claude/worktrees/**',
     ],
+
+    // These tests do real work — `git worktree add` against a real repository,
+    // a real pty running a real executable — and they all run at once. The 5s
+    // default is comfortable for one file and marginal for thirteen, which
+    // shows up as a test that passes alone and times out in the suite.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 })

@@ -10,7 +10,10 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { createContext, useCallback, useContext, useEffect } from 'react'
+import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
+import { runKey } from './key.js'
+import { Session } from './Session.js'
 
 export type NodeData = {
   label: string
@@ -64,7 +67,7 @@ export const App = () => {
       void (async () => {
         await fetch('/api/fork', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
           body: JSON.stringify({ parentId }),
         })
         // Don't make the user wait out a poll to see what they just did.
@@ -80,30 +83,45 @@ export const App = () => {
     return () => clearInterval(timer)
   }, [load])
 
+  // Picking a Node on the graph is the whole gesture for "talk to this agent".
+  const selected = nodes.find((node) => node.selected)
+
   return (
     <div className="app">
-      <ForkContext.Provider value={onFork}>
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          nodeTypes={nodeTypes}
-          fitView
-          fitViewOptions={{ maxZoom: 1 }}
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background gap={24} size={1} />
-          <Controls showInteractive={false} />
-        </ReactFlow>
-      </ForkContext.Provider>
+      <div className="app__graph">
+        <ForkContext.Provider value={onFork}>
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            nodeTypes={nodeTypes}
+            fitView
+            fitViewOptions={{ maxZoom: 1 }}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background gap={24} size={1} />
+            <Controls showInteractive={false} />
+          </ReactFlow>
+        </ForkContext.Provider>
 
-      {nodes.length <= 1 && (
-        <p className="banner">
-          This is your <strong>Trunk</strong>. Fork from it to try something without
-          touching it — and throw the fork away if it doesn&rsquo;t work out.
-        </p>
-      )}
+        {nodes.length <= 1 && (
+          <p className="banner">
+            This is your <strong>Trunk</strong>. Fork from it to try something without
+            touching it — and throw the fork away if it doesn&rsquo;t work out.
+          </p>
+        )}
+      </div>
+
+      <aside className="app__session">
+        {selected === undefined ? (
+          <p className="session__empty">Pick a Node to talk to its agent.</p>
+        ) : (
+          // Remounting per Node is deliberate: each Node gets its own terminal,
+          // and the one being left behind keeps running on the server.
+          <Session key={selected.id} nodeId={selected.id} label={selected.data.label} />
+        )}
+      </aside>
     </div>
   )
 }

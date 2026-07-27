@@ -6,6 +6,7 @@ Decisions already made — do not relitigate:
 
 - [ADR-0001](docs/adr/0001-node-is-a-fork.md) — a Node is a fork, not a task.
 - [ADR-0002](docs/adr/0002-fork-captures-a-moment.md) — a Fork captures *this instant*, including uncommitted changes.
+- [ADR-0003](docs/adr/0003-localhost-is-not-a-trust-boundary.md) — localhost is not a trust boundary. Every state-changing endpoint takes this run's key *and* refuses a foreign Origin.
 
 ## Stack
 

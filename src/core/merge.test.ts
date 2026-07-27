@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mergeGraph } from './merge.js'
-import type { FlowGraph, FlowNode } from './flow.js'
+import type { FlowEdge, FlowGraph, FlowNode } from './flow.js'
 
 const node = (id: string, over: Partial<FlowNode> = {}): FlowNode => ({
   id,
@@ -52,6 +52,18 @@ describe('mergeGraph', () => {
     const merged = mergeGraph(onScreen, graph([node('trunk')]))
 
     expect(merged.nodes[0]?.selected).toBe(true)
+  })
+
+  it('keeps what the browser measured, so a poll cannot leave a node unclickable', () => {
+    // ReactFlow hides — and stops hit-testing — any node whose dimensions it
+    // does not know. Those dimensions are the browser's to own, like position
+    // and selection, so a poll must not wipe them.
+    type Measured = FlowNode & { measured?: { width: number; height: number } }
+    const onScreen: Measured[] = [{ ...node('trunk'), measured: { width: 292, height: 88 } }]
+
+    const merged = mergeGraph<Measured, FlowEdge>(onScreen, graph([node('trunk')]))
+
+    expect(merged.nodes[0]?.measured).toEqual({ width: 292, height: 88 })
   })
 
   it('takes edges from the server as-is', () => {
