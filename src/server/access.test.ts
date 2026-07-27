@@ -55,11 +55,26 @@ const git = (cwd: string, ...args: string[]) =>
 const settle = async (check: () => void): Promise<void> =>
   vi.waitFor(check, { timeout: 8_000, interval: 20 })
 
-/** Attach to a Node's agent, with whatever the caller wants on the wire. */
-const attach = (nodeId: string, sent: { origin?: string; key?: string } = {}) => {
+/**
+ * Attach to a Node's agent, with whatever the caller wants on the wire.
+ *
+ * `key` goes up the way the page sends it, as a subprotocol. `keyInUrl` puts it
+ * in the query string instead — the carrier ADR-0003 turned down — and offers
+ * only the plain subprotocol, so the key in the url is the sole thing the
+ * server could possibly let it in on.
+ */
+const attach = (nodeId: string, sent: { origin?: string; key?: string; keyInUrl?: string } = {}) => {
+  const protocols =
+    sent.key !== undefined
+      ? [SESSION_PROTOCOL, keyProtocol(sent.key)]
+      : sent.keyInUrl !== undefined
+        ? [SESSION_PROTOCOL]
+        : []
+
   const socket = new WebSocket(
-    `${url.replace(/^http/, 'ws')}/session?node=${nodeId}`,
-    sent.key === undefined ? [] : ['nodegraph', keyProtocol(sent.key)],
+    `${url.replace(/^http/, 'ws')}/session?node=${nodeId}` +
+      (sent.keyInUrl === undefined ? '' : `&key=${sent.keyInUrl}`),
+    protocols,
     sent.origin === undefined ? {} : { origin: sent.origin },
   )
   opened.push(socket)
@@ -110,6 +125,24 @@ const keyFromPage = async (): Promise<string> => {
  */
 const carries = (text: string, key: string): boolean => text.includes(key)
 
+/**
+ * The names of the headers on a response, lowercased — and only the names. A
+ * failing assertion prints what it was given, and a header *value* is exactly
+ * where this run's key would be if it ever leaked into one.
+ *
+ * `rawHeaders` alternates name, value, name, value.
+ */
+const namesOf = (rawHeaders: string[]): string[] =>
+  rawHeaders.filter((_, at) => at % 2 === 0).map((name) => name.toLowerCase())
+
+/** The same, off a response we read as bytes rather than let node parse. */
+const namesIn = (head: string): string[] =>
+  head
+    .split('\r\n')
+    .slice(1)
+    .filter((line) => line.includes(':'))
+    .map((line) => line.slice(0, line.indexOf(':')).trim().toLowerCase())
+
 /** The port we are really listening on, which is the one thing a forged Host cannot change. */
 const port = (): number => Number(new URL(url).port)
 
@@ -124,7 +157,7 @@ const raw = (sent: {
   path: string
   headers?: Record<string, string>
   body?: string
-}): Promise<{ status: number; head: string; body: string }> =>
+}): Promise<{ status: number; head: string; headerNames: string[]; body: string }> =>
   new Promise((done, fail) => {
     const outgoing = httpRequest(
       {
@@ -141,7 +174,12 @@ const raw = (sent: {
           body += chunk
         })
         incoming.on('end', () =>
-          done({ status: incoming.statusCode ?? 0, head: incoming.rawHeaders.join('\n'), body }),
+          done({
+            status: incoming.statusCode ?? 0,
+            head: incoming.rawHeaders.join('\n'),
+            headerNames: namesOf(incoming.rawHeaders),
+            body,
+          }),
         )
       },
     )
@@ -201,6 +239,7 @@ beforeEach(async () => {
     join(webRoot, 'index.html'),
     '<!doctype html><html><head><title>nodegraph</title></head><body><div id="root"></div></body></html>',
   )
+  writeFileSync(join(webRoot, 'app.js'), 'console.log("nodegraph")')
 
   repo = join(sandbox, 'repo')
   mkdirSync(repo)
@@ -426,6 +465,31 @@ describe('a caller that sends no origin at all', () => {
   })
 })
 
+/**
+ * The key is the entire second door, and the only thing that makes it a door
+ * is that it cannot be worked out. Randomness is not something a test can look
+ * at directly — so pin the two things a key anybody could derive gives up
+ * instead. Anything read off the clock, or off a counter, is short enough to
+ * walk through and comes out the same for two nodegraphs started together;
+ * being *different from the last one* is a bar a wall clock clears easily.
+ */
+describe('the key this run mints', () => {
+  it('is too long to guess, and no two runs share one however close together they start', async () => {
+    const started = await Promise.all(
+      Array.from({ length: 32 }, () => startServer({ repoPath: repo, port: 0, webRoot })),
+    )
+    const keys = started.map((server) => server.key)
+    await Promise.all(started.map((server) => server.close()))
+
+    // Only the length, never the key itself — a failure here is printed.
+    for (const key of keys) expect(key.length).toBeGreaterThanOrEqual(32)
+
+    // Thirty-two of them minted inside the same handful of milliseconds. A key
+    // that is the time of day would hand most of them the very same one.
+    expect(new Set(keys).size).toBe(keys.length)
+  })
+})
+
 describe('the page nodegraph itself serves', () => {
   it('is given the key, and can attach to the agent and drive it', async () => {
     const key = await keyFromPage()
@@ -462,6 +526,47 @@ describe('the page nodegraph itself serves', () => {
     for (const found of html.matchAll(/(?:href|src|action)="([^"]*)"/g)) {
       expect(found[1]).not.toContain(key)
     }
+  })
+})
+
+/**
+ * The key travels in a header and in a websocket subprotocol, and is refused
+ * anywhere else — ADR-0003.
+ *
+ * A url is the one part of a request that everything writes down: this
+ * server's own log, the Referer carried to the next link the user follows, the
+ * browser's history, the shoulder of anyone reading the address bar. The key is
+ * minted to die with the process; a url outlives it, somewhere the process can
+ * never reach to take it back.
+ *
+ * Serving no url with the key in it is only half of that, and the half already
+ * guarded. This is the other half: refusing to *accept* one. Leave the door
+ * open and the day someone finds `?key=` easier the page starts using it, and
+ * the key starts getting written down everywhere — with every existing test
+ * still passing. So the key is handed over here in full, correct and current,
+ * in the wrong place, and that alone has to be disqualifying.
+ */
+describe('a caller that puts this run’s key in the url instead', () => {
+  it('cannot attach to the agent with it', async () => {
+    // Origin is our own, so the carrier is the only thing being judged.
+    const attacker = attach('trunk', { origin: url, keyInUrl: await keyFromPage() })
+
+    await expect(attacker.handshake).resolves.toBe('refused')
+    expect(attacker.screen()).not.toContain('CWD[')
+  })
+
+  it('cannot fork a Node with it', async () => {
+    const before = await nodeIds()
+
+    const response = await fetch(`${url}/api/fork?key=${await keyFromPage()}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: url },
+      body: JSON.stringify({ parentId: 'trunk' }),
+    })
+
+    expect(response.status).toBe(403)
+    await expect(nodeIds()).resolves.toEqual(before)
+    expect(git(repo, 'worktree', 'list')).not.toContain('.nodegraph')
   })
 })
 
@@ -509,6 +614,41 @@ describe('the page this run’s key is handed out in', () => {
       // A missing header is the same failure as a permissive one, so read it
       // as the empty string rather than letting `null` blow up the assertion.
       expect(response.headers.get('cache-control') ?? '').toContain('no-store')
+    }
+  })
+})
+
+/**
+ * Not one `Access-Control-Allow-Origin`, from any endpoint, ever — ADR-0003.
+ *
+ * The same-origin policy is the only reason it is safe to write this run's key
+ * into the page: another website may open a request to 127.0.0.1, but it cannot
+ * read what comes back. A CORS header is this server volunteering to switch
+ * that off. Added once for the convenience of a dev proxy it hands every site
+ * the user visits the key and the api together, and every other test in here
+ * would go on passing — which is why the assertion is on the absence itself,
+ * across every shape of response, and not on any one exploit.
+ */
+describe('every response nodegraph writes', () => {
+  it('never invites another website to read it', async () => {
+    // One of each writer: the page the key is in, a static file, an api read,
+    // an api refusal, and the upgrade refusal, which is spelled out by hand
+    // and so has its own headers and its own chance to drift.
+    const written = [
+      await raw({ method: 'GET', path: '/' }),
+      await raw({ method: 'GET', path: '/app.js' }),
+      await raw({ method: 'GET', path: '/api/nodes' }),
+      await raw({ method: 'POST', path: '/api/fork', headers: { origin: EVIL }, body: '{}' }),
+    ]
+    const upgrade = await rawHandshake('trunk', [SESSION_PROTOCOL])
+
+    // Each really is the response it is meant to stand for, so the assertion
+    // below is about a header that was missing and not a reply that never came.
+    expect(written.map((response) => response.status)).toEqual([200, 200, 200, 403])
+    expect(upgrade.split('\r\n')[0]).toContain('403')
+
+    for (const names of [...written.map((response) => response.headerNames), namesIn(upgrade)]) {
+      expect(names.filter((name) => name.startsWith('access-control'))).toEqual([])
     }
   })
 })

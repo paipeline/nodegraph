@@ -32,6 +32,19 @@ describe('deciding who may reach a running nodegraph', () => {
     })
   })
 
+  /**
+   * An origin is one string and it either is ours or it is not — matched whole,
+   * never by how it begins. Ports are written without padding, so our own
+   * 4571 is the opening of 45710 through 45719 as well; a page served from any
+   * of those is a stranger who happens to have moved in next door, and a check
+   * that read origins as prefixes would hold the door for all ten of them.
+   */
+  it('turns away a neighbour whose port merely begins with ours', () => {
+    for (const origin of ['http://127.0.0.1:45710', 'http://localhost:45719']) {
+      expect(admit({ ...honest, origin }, trust)).toMatchObject({ allowed: false })
+    }
+  })
+
   it('turns away a caller that changes something without this run’s key', () => {
     expect(admit({ ...honest, origin: null, key: null }, trust)).toMatchObject({ allowed: false })
     expect(admit({ ...honest, origin: null, key: 'let-me-in' }, trust)).toMatchObject({
@@ -41,6 +54,30 @@ describe('deciding who may reach a running nodegraph', () => {
     expect(admit({ ...honest, origin: null, key: `${KEY.slice(0, -1)}X` }, trust)).toMatchObject({
       allowed: false,
     })
+  })
+
+  /**
+   * The key is compared all the way to the end, every time, so how long the
+   * answer takes says nothing about how much of it a caller guessed right.
+   * Timing is not a thing a test can pin down without flaking — but a
+   * comparison that gives up early gives itself away in what it lets through,
+   * and that is observable: it stops looking, so anything after the point it
+   * stopped at is free. Both ends of the key have to matter.
+   */
+  it('turns away a key that only starts like this run’s, or that runs on past it', () => {
+    const almost = { ...honest, origin: null }
+
+    // One character short: everything it does offer is right.
+    expect(admit({ ...almost, key: KEY.slice(0, -1) }, trust)).toMatchObject({ allowed: false })
+    // The whole key, and then some — a comparison that stops at the end of the
+    // real one never sees the tail.
+    expect(admit({ ...almost, key: `${KEY}-and-then-some` }, trust)).toMatchObject({
+      allowed: false,
+    })
+    // Nothing but a first character in common.
+    expect(admit({ ...almost, key: KEY.slice(0, 1) }, trust)).toMatchObject({ allowed: false })
+    // The empty string, which is a prefix of everything.
+    expect(admit({ ...almost, key: '' }, trust)).toMatchObject({ allowed: false })
   })
 
   it('turns away a caller attaching to an agent without this run’s key', () => {
