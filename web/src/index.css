@@ -107,16 +107,21 @@ body {
 
 .banner {
   position: absolute;
-  bottom: 24px;
-  left: 50%;
-  max-width: 520px;
+  bottom: 16px;
+  left: 16px;
+  max-width: min(380px, calc(100% - 32px));
   margin: 0;
-  padding: 12px 16px;
+  padding: 10px 14px;
   border: 1px solid var(--card-border);
   border-radius: 10px;
-  background: var(--card);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
   color: var(--muted);
-  transform: translateX(-50%);
+  font-size: 13px;
+  backdrop-filter: blur(6px);
+
+  /* It sits over the canvas, so it must never swallow a click meant for a
+     Node or the Fork button underneath it. */
+  pointer-events: none;
 }
 
 .banner strong {
