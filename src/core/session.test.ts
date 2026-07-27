@@ -29,12 +29,13 @@ describe('the line the user writes when they Fork', () => {
   })
 })
 
-describe('launching an agent for a Node', () => {
+describe('launching an agent for a Node whose Context has still to be made', () => {
   it('runs the claude TUI in that Node’s Workspace, under a Context of its own', () => {
     expect(
       toLaunch({
         workspacePath: '/somewhere/workspace',
         sessionId: '11111111-2222-3333-4444-555555555555',
+        exists: false,
       }),
     ).toEqual({
       command: 'claude',
@@ -42,41 +43,60 @@ describe('launching an agent for a Node', () => {
       cwd: '/somewhere/workspace',
     })
   })
+
+  it('starts it rather than resuming it, however sure we were that it was there', () => {
+    // A Context that was named but never created — an agent opened and never
+    // spoken to. Resuming it would kill the session the moment it started, and
+    // the Node would never open again.
+    expect(
+      toLaunch({
+        workspacePath: '/somewhere/workspace',
+        sessionId: '11111111-2222-3333-4444-555555555555',
+        exists: false,
+      }).args,
+    ).not.toContain('--resume')
+  })
 })
 
-describe('launching an agent that inherits a Node’s Context', () => {
-  it('cuts the child’s own session from the parent’s, and opens it on the line the user wrote', () => {
+describe('launching an agent on a Context that already exists', () => {
+  it('resumes that Context, and opens it on the line the Fork was given', () => {
     expect(
       toLaunch({
         workspacePath: '/somewhere/child',
         sessionId: '11111111-2222-3333-4444-555555555555',
-        forkedFrom: '99999999-8888-7777-6666-555555555555',
+        exists: true,
         intent: 'try it with a queue instead',
       }),
     ).toEqual({
       command: 'claude',
       args: [
         '--resume',
-        '99999999-8888-7777-6666-555555555555',
-        '--fork-session',
-        '--session-id',
         '11111111-2222-3333-4444-555555555555',
         'try it with a queue instead',
       ],
       cwd: '/somewhere/child',
     })
   })
-})
 
-describe('launching an agent whose Node already has a Context of its own', () => {
-  it('resumes that Context rather than cutting it from the parent again', () => {
+  it('never asks claude to fork a Context — a Fork has already done that, in a directory claude cannot see', () => {
+    const launch = toLaunch({
+      workspacePath: '/somewhere/child',
+      sessionId: '11111111-2222-3333-4444-555555555555',
+      exists: true,
+      intent: 'try it with a queue instead',
+    })
+
+    expect(launch.args).not.toContain('--fork-session')
+    expect(launch.args).not.toContain('--session-id')
+  })
+
+  it('resumes it and nothing more once the Node has been opened before', () => {
     expect(
       toLaunch({
         workspacePath: '/somewhere/child',
         sessionId: '11111111-2222-3333-4444-555555555555',
-        forkedFrom: '99999999-8888-7777-6666-555555555555',
-        intent: 'try it with a queue instead',
-        started: true,
+        exists: true,
+        intent: null,
       }),
     ).toEqual({
       command: 'claude',

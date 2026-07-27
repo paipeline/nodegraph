@@ -10,22 +10,42 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { contextPath } from '../core/context.js'
 import { fork } from './fork.js'
 import { readForks, recordSession } from './store.js'
 
 const PARENT_SESSION = '99999999-8888-7777-6666-555555555555'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
+let sandbox: string
 let repo: string
+let claudeHome: string
+let originalClaudeHome: string | undefined
 let firstCommit: string
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
+/** The Trunk's Context, exactly where claude keeps one — see ADR-0004. */
+const givenTrunkHasSaid = (said: string): void => {
+  const path = contextPath(claudeHome, repo, PARENT_SESSION)
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify({ type: 'user', sessionId: PARENT_SESSION, said })}\n`)
+}
+
 beforeEach(() => {
-  repo = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-fork-')))
+  sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-fork-')))
+
+  // Contexts are looked for here, never in the person's own claude home.
+  claudeHome = join(sandbox, 'claude-home')
+  mkdirSync(claudeHome)
+  originalClaudeHome = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = claudeHome
+
+  repo = join(sandbox, 'repo')
+  mkdirSync(repo)
   git(repo, 'init', '-b', 'main', '-q')
   git(repo, 'config', 'user.email', 'test@example.com')
   git(repo, 'config', 'user.name', 'Test')
@@ -36,7 +56,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  rmSync(repo, { recursive: true, force: true })
+  if (originalClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeHome
+  rmSync(sandbox, { recursive: true, force: true })
 })
 
 describe('forking a Node', () => {
@@ -63,6 +85,7 @@ describe('forking a Node', () => {
       sessionId: PARENT_SESSION,
       startedAt: '2026-07-27T09:00:00.000Z',
     })
+    givenTrunkHasSaid('the-api-key-lives-in-vault')
 
     const child = await fork({ repoPath: repo, parentId: 'trunk', intent: 'try it with a queue' })
 
@@ -73,6 +96,21 @@ describe('forking a Node', () => {
 
     // Both halves survive a restart, or the child could never be launched.
     await expect(readForks(repo)).resolves.toEqual([child])
+  })
+
+  it('says plainly that no understanding came across, when the parent had none to give', async () => {
+    // A Node whose agent was started and never spoken to: the store names a
+    // Context, but claude never made one.
+    await recordSession(repo, {
+      nodeId: 'trunk',
+      sessionId: PARENT_SESSION,
+      startedAt: '2026-07-27T09:00:00.000Z',
+    })
+
+    const child = await fork({ repoPath: repo, parentId: 'trunk' })
+
+    expect(child.parentSessionId).toBeNull()
+    expect(child.sessionId).toMatch(UUID)
   })
 
   it('leaves no Workspace, branch or record behind when it cannot be written down', async () => {

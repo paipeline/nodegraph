@@ -12,10 +12,41 @@ import { startServer } from './server.js'
  * so these tests never reach a model, an account or the network. It answers
  * `size` with what the tty reports, which is how we can see the terminal the
  * agent believes it is running in.
+ *
+ * It also keeps its Contexts where the real one does — a file per session under
+ * the claude home, filed by the directory it was run in (ADR-0004) — and it
+ * refuses to resume one that was never made, exactly as the real one does. That
+ * is what lets a Fork's inheritance be watched through the socket the browser
+ * uses, rather than only asserted underneath it.
  */
 const FAKE_CLAUDE = `#!/bin/sh
-printf 'ARGV[%s]\\n' "$*"
-printf 'CWD[%s]\\n' "$(pwd -P)"
+argv="$*"
+here=$(pwd -P)
+home="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+dir="$home/projects/$(printf '%s' "$here" | tr '/._' '---')"
+id=''
+resume=no
+prompt=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) id="$2"; shift 2 ;;
+    --resume) id="$2"; resume=yes; shift 2 ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+file="$dir/$id.jsonl"
+if [ "$resume" = yes ] && [ ! -f "$file" ]; then
+  printf 'No conversation found with session ID: %s\\n' "$id"
+  exit 1
+fi
+say() {
+  printf '{"sessionId":"%s","cwd":"%s","said":"%s"}\\n' "$id" "$here" "$1" >> "$file"
+}
+printf 'ARGV[%s]\\n' "$argv"
+printf 'CWD[%s]\\n' "$here"
+mkdir -p "$dir"
+if [ -n "$prompt" ]; then say "$prompt"; fi
+if [ -f "$file" ]; then printf 'CTX[%s]\\n' "$(tr '\\n' '|' < "$file")"; else printf 'CTX[]\\n'; fi
 while IFS= read -r line; do
   if [ "$line" = "quit" ]; then exit 7; fi
   if [ "$line" = "size" ]; then printf 'SIZE[%s]\\n' "$(stty size)"; continue; fi
@@ -25,6 +56,7 @@ while IFS= read -r line; do
     printf 'DONE\\n'
     continue
   fi
+  say "$line"
   printf 'HEARD[%s]\\n' "$line"
 done
 `
@@ -33,7 +65,9 @@ type Frame = { type: string; [key: string]: unknown }
 
 let sandbox: string
 let repo: string
+let claudeHome: string
 let originalPath: string | undefined
+let originalClaudeHome: string | undefined
 let url: string
 let key: string
 let stop: (() => Promise<void>) | undefined
@@ -42,8 +76,13 @@ const opened: WebSocket[] = []
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
+/**
+ * Waits for something to become true. The ceiling is generous because every
+ * file in this suite runs at once, each with real ptys and real git in it — a
+ * short ceiling here does not catch bugs, it just fails under load.
+ */
 const settle = async (check: () => void): Promise<void> =>
-  vi.waitFor(check, { timeout: 4_000, interval: 20 })
+  vi.waitFor(check, { timeout: 15_000, interval: 20 })
 
 /** A viewer, the way a browser tab is a viewer — key and all. */
 const view = (nodeId: string) => {
@@ -93,6 +132,12 @@ beforeEach(async () => {
   originalPath = process.env.PATH
   process.env.PATH = `${bin}:${originalPath ?? ''}`
 
+  // Contexts land here rather than in the person's own claude home.
+  claudeHome = join(sandbox, 'claude-home')
+  mkdirSync(claudeHome)
+  originalClaudeHome = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = claudeHome
+
   repo = join(sandbox, 'repo')
   mkdirSync(repo)
   git(repo, 'init', '-b', 'main', '-q')
@@ -112,6 +157,8 @@ afterEach(async () => {
   for (const socket of opened.splice(0)) socket.terminate()
   await stop?.()
   process.env.PATH = originalPath
+  if (originalClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeHome
   rmSync(sandbox, { recursive: true, force: true })
 })
 
@@ -218,6 +265,43 @@ describe('the line written when a Node is Forked', () => {
       error: expect.stringContaining('flag'),
     })
     expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+  })
+})
+
+describe('the understanding a Forked Node opens with', () => {
+  it('is everything the parent had worked out, and none of what it said afterwards', async () => {
+    const parent = view('trunk')
+    await settle(() => expect(parent.screen()).toContain('CWD['))
+    parent.send({ type: 'input', data: 'the-api-key-lives-in-vault\r' })
+    await settle(() => expect(parent.screen()).toContain('HEARD[the-api-key-lives-in-vault]'))
+
+    // ADR-0002: the Fork waits until the agent has stopped for the user, so
+    // this is the click the user gets to make, not one we sneak in early.
+    const forked = await vi.waitFor(
+      async () => {
+        const response = await forkFrom('trunk', 'try a queue instead')
+        expect(response.status).toBe(201)
+        return response
+      },
+      { timeout: 20_000, interval: 100 },
+    )
+    const { node } = (await forked.json()) as { node: { id: string } }
+
+    // The parent goes on thinking. None of this is the child's.
+    parent.send({ type: 'input', data: 'SAID-AFTER-THE-FORK\r' })
+    await settle(() => expect(parent.screen()).toContain('HEARD[SAID-AFTER-THE-FORK]'))
+
+    const child = view(node.id)
+    await settle(() => expect(child.screen()).toContain('CTX['))
+
+    expect(child.screen()).toContain('the-api-key-lives-in-vault')
+    expect(child.screen()).not.toContain('SAID-AFTER-THE-FORK')
+    expect(child.screen()).toContain('try a queue instead')
+
+    // And what the child works out never travels back up.
+    child.send({ type: 'input', data: 'THE-CHILD-WORKED-THIS-OUT\r' })
+    await settle(() => expect(child.screen()).toContain('HEARD[THE-CHILD-WORKED-THIS-OUT]'))
+    expect(parent.screen()).not.toContain('THE-CHILD-WORKED-THIS-OUT')
   })
 })
 

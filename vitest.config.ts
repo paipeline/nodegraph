@@ -14,6 +14,9 @@ export default defineConfig({
       '**/.claude/worktrees/**',
     ],
 
+    // Keeps every test away from the Contexts on the machine it runs on.
+    setupFiles: ['./vitest.setup.ts'],
+
     // These tests do real work — `git worktree add` against a real repository,
     // a real pty running a real executable — and they all run at once. The 5s
     // default is comfortable for one file and marginal for thirteen, which

@@ -1,9 +1,10 @@
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { contextPath } from '../core/context.js'
 import { SessionSupervisor } from './session.js'
-import { readSessions, recordFork, recordSession } from './store.js'
+import { readSessions, recordFork } from './store.js'
 
 const PARENT_SESSION = '99999999-8888-7777-6666-555555555555'
 const CHILD_SESSION = '11111111-2222-3333-4444-555555555555'
@@ -25,7 +26,9 @@ done
 let sandbox: string
 let repo: string
 let workspace: string
+let claudeHome: string
 let originalPath: string | undefined
+let originalClaudeHome: string | undefined
 let supervisor: SessionSupervisor
 
 const settle = async (check: () => void): Promise<void> =>
@@ -47,12 +50,20 @@ beforeEach(() => {
   originalPath = process.env.PATH
   process.env.PATH = `${bin}:${originalPath ?? ''}`
 
+  // Contexts are looked for here, never in the person's own claude home.
+  claudeHome = join(sandbox, 'claude-home')
+  mkdirSync(claudeHome)
+  originalClaudeHome = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = claudeHome
+
   supervisor = new SessionSupervisor(repo)
 })
 
 afterEach(() => {
   supervisor.stopAll()
   process.env.PATH = originalPath
+  if (originalClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeHome
   rmSync(sandbox, { recursive: true, force: true })
 })
 
@@ -108,13 +119,15 @@ describe('opening a session on a Node', () => {
 })
 
 describe('opening a session on a Node that was Forked from another', () => {
-  it('cuts its Context from the parent’s and opens it on the line the Fork was given', async () => {
-    await recordSession(repo, {
-      nodeId: 'trunk',
-      sessionId: PARENT_SESSION,
-      startedAt: '2026-07-27T09:00:00.000Z',
-    })
-    await recordFork(repo, {
+  /** The Context the Fork already placed for this Node, as claude keeps them. */
+  const placeContext = (sessionId: string, said: string): void => {
+    const path = contextPath(claudeHome, workspace, sessionId)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, `${JSON.stringify({ type: 'user', sessionId, said })}\n`)
+  }
+
+  const recordChild = () =>
+    recordFork(repo, {
       id: 'child',
       parentId: 'trunk',
       branch: 'nodegraph/child',
@@ -125,39 +138,35 @@ describe('opening a session on a Node that was Forked from another', () => {
       parentSessionId: PARENT_SESSION,
       intent: 'try it with a queue instead',
     })
+
+  it('opens the Context the Fork already cut for it, on the line the Fork was given', async () => {
+    await recordChild()
+    // The Fork put the parent's understanding here, under the child's own name,
+    // at the moment it was taken — see ADR-0004.
+    placeContext(CHILD_SESSION, 'the-api-key-lives-in-vault')
 
     const session = await supervisor.open('child', workspace)
 
     await settle(() => expect(session.scrollback()).toContain('CWD['))
     expect(session.scrollback()).toContain(
-      `ARGV[--resume ${PARENT_SESSION} --fork-session --session-id ${CHILD_SESSION} try it with a queue instead]`,
+      `ARGV[--resume ${CHILD_SESSION} try it with a queue instead]`,
     )
+    // Never the parent's: claude looks for a Context only in the directory it
+    // is run from, and the parent's is in a different Workspace entirely.
+    expect(session.scrollback()).not.toContain(PARENT_SESSION)
+    expect(session.scrollback()).not.toContain('--fork-session')
   })
 
   it('resumes the Context that Node has since built up, rather than cutting it from the parent twice', async () => {
-    await recordSession(repo, {
-      nodeId: 'trunk',
-      sessionId: PARENT_SESSION,
-      startedAt: '2026-07-27T09:00:00.000Z',
-    })
-    await recordFork(repo, {
-      id: 'child',
-      parentId: 'trunk',
-      branch: 'nodegraph/child',
-      workspacePath: workspace,
-      forkPointSha: '0123456789abcdef0123456789abcdef01234567',
-      createdAt: '2026-07-27T09:01:00.000Z',
-      sessionId: CHILD_SESSION,
-      parentSessionId: PARENT_SESSION,
-      intent: 'try it with a queue instead',
-    })
+    await recordChild()
+    placeContext(CHILD_SESSION, 'the-api-key-lives-in-vault')
 
     const first = await supervisor.open('child', workspace)
     await settle(() => expect(first.scrollback()).toContain('CWD['))
     supervisor.stopAll()
 
     // A second nodegraph, or the same one tomorrow: the Node's own Context is
-    // the one it goes back to, and the parent is not consulted again.
+    // the one it goes back to, and the line it was Forked on is not said again.
     const later = new SessionSupervisor(repo)
     const reopened = await later.open('child', workspace)
     await settle(() => expect(reopened.scrollback()).toContain('CWD['))

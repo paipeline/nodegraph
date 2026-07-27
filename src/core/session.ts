@@ -48,11 +48,13 @@ export type NodeContext = {
   /** The session this Node's Context lives in — nodegraph names it, so it can find it again. */
   sessionId: string
   /**
-   * The parent's session, when this Node's Context has still to be cut from
-   * it. Null for the Trunk, and for a Node forked from one that had never been
-   * talked to — there is no understanding to inherit.
+   * Whether that Context has actually been created yet. This is a fact about
+   * the disk, gathered by an adapter, never an inference from having written
+   * the name down: an agent that was started and never spoken to leaves no
+   * Context behind, and resuming one that was never made kills the session on
+   * the spot — which is how a Node becomes permanently unopenable.
    */
-  forkedFrom?: string | null
+  exists: boolean
   /** The one line written at Fork time: this Node's first instruction. */
   intent?: string | null
 }
@@ -63,23 +65,20 @@ export type NodeContext = {
  * further flag is a way for the session to stop behaving like the one the user
  * gets in their own terminal, and fidelity is the whole point of using a pty.
  *
- * A Node whose session already exists is resumed and nothing more. Cutting it
- * from the parent a second time would throw away everything the Node itself
- * has since worked out — see `toLaunch`'s callers, which say so with `started`.
+ * There is no forking here. A Fork copies the parent's Context at the moment it
+ * is taken, so by the time anybody opens a child Node its Context is already
+ * its own and is simply resumed. Asking claude to fork at launch could not work
+ * anyway: it only ever looks for a Context in the directory it is run from, and
+ * a child Node runs in a Workspace of its own. See ADR-0004.
  */
-export const toLaunch = (node: NodeContext & { started?: boolean }): Launch => {
-  const args =
-    node.started === true
-      ? ['--resume', node.sessionId]
-      : node.forkedFrom
-        ? // The child's Context starts as a copy of the parent's, under a name
-          // of its own, so that neither one can write on the other again.
-          ['--resume', node.forkedFrom, '--fork-session', '--session-id', node.sessionId]
-        : ['--session-id', node.sessionId]
+export const toLaunch = (node: NodeContext): Launch => {
+  const args = node.exists
+    ? ['--resume', node.sessionId]
+    : ['--session-id', node.sessionId]
 
   // Last, and only ever as the trailing prompt — `claude` reads a leading dash
   // as a flag of its own, which is why an intent may not start with one.
-  if (node.started !== true && node.intent) args.push(node.intent)
+  if (node.intent) args.push(node.intent)
 
   return { command: 'claude', args, cwd: node.workspacePath }
 }

@@ -6,6 +6,7 @@ import {
   type AgentActivity,
   type NodeContext,
 } from '../core/session.js'
+import { hasContext } from './context.js'
 import { readForks, readSessions, recordSession } from './store.js'
 
 /**
@@ -72,33 +73,28 @@ export class SessionSupervisor {
   /**
    * Which Context this Node's agent belongs in.
    *
-   * A Node that has been opened before is resumed and nothing else. A Node
-   * Forked from another is cut from the parent's Context the first time, and
-   * carries the line the Fork was given as its opening instruction. Everything
-   * else — the Trunk, and Forks recorded before nodegraph carried Contexts —
-   * simply starts a Context of its own.
+   * The name comes from what was written down — the Node's own Context once it
+   * has been opened, otherwise the one reserved for it at the moment it was
+   * Forked, otherwise a fresh one. Whether that Context *exists* is a separate
+   * question, and only the disk may answer it: a Context that was named but
+   * never created has to be started, not resumed.
+   *
+   * The line written at Fork time is the Node's *first* instruction, so it is
+   * carried only while the Node has never been opened.
    */
-  async #contextOf(
-    nodeId: string,
-    workspacePath: string,
-  ): Promise<NodeContext & { started: boolean }> {
+  async #contextOf(nodeId: string, workspacePath: string): Promise<NodeContext> {
     const own = (await readSessions(this.#repoPath)).find((session) => session.nodeId === nodeId)
-    if (own !== undefined) {
-      return { workspacePath, sessionId: own.sessionId, started: true }
-    }
-
     const record = (await readForks(this.#repoPath)).find((fork) => fork.id === nodeId)
-    if (record?.sessionId !== undefined) {
-      return {
-        workspacePath,
-        sessionId: record.sessionId,
-        forkedFrom: record.parentSessionId ?? null,
-        intent: record.intent ?? null,
-        started: false,
-      }
-    }
 
-    return { workspacePath, sessionId: randomUUID(), started: false }
+    const sessionId = own?.sessionId ?? record?.sessionId ?? randomUUID()
+    const intent = own === undefined ? (record?.intent ?? null) : null
+
+    return {
+      workspacePath,
+      sessionId,
+      exists: await hasContext(workspacePath, sessionId),
+      intent,
+    }
   }
 
   async #start(nodeId: string, workspacePath: string): Promise<Session> {
@@ -154,9 +150,10 @@ export class SessionSupervisor {
     this.#sessions.set(nodeId, session)
 
     try {
-      // From here the Context exists on disk, so it has to be written down: a
-      // Context nobody wrote down would be cut from the parent all over again
-      // next time, throwing away everything this Node had worked out.
+      // Which Context this Node is living in, written down so that the next
+      // nodegraph goes back to it rather than starting the Node over. It says
+      // the Context's *name*, not that claude has created it — that is read off
+      // the disk every time, in `#contextOf`.
       await recordSession(this.#repoPath, {
         nodeId,
         sessionId: context.sessionId,
