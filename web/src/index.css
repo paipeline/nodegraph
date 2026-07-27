@@ -7,6 +7,7 @@
   --muted: #8b93a3;
   --trunk: #5b8dee;
   --fork: #8b6ce8;
+  --failed: #e8746c;
   color-scheme: dark;
 }
 
@@ -103,6 +104,19 @@ body {
   color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.card__environment {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.card__environment--preparing {
+  color: var(--trunk);
+}
+
+.card__environment--failed {
+  color: var(--failed);
 }
 
 .banner {

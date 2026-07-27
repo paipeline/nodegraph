@@ -20,9 +20,22 @@ export type NodeData = {
   kind: 'trunk' | 'fork'
   branch: string | null
   workspacePath: string
+  environment: 'preparing' | 'ready' | 'failed'
 }
 
 type GraphNode = Node<NodeData>
+
+/**
+ * A Node is handed over the moment its code is there, with the heavy part of
+ * the environment still landing behind it. Saying so is the difference between
+ * an agent that is about to be able to run the tests and a Workspace that is
+ * quietly broken.
+ */
+const ENVIRONMENT: Record<NodeData['environment'], string | null> = {
+  ready: null,
+  preparing: 'environment landing…',
+  failed: 'environment failed',
+}
 
 const POLL_MS = 2000
 
@@ -39,6 +52,11 @@ const NodeCard = ({ id, data }: NodeProps<GraphNode>) => {
       <span className="card__path" title={data.workspacePath}>
         {data.workspacePath}
       </span>
+      {ENVIRONMENT[data.environment] !== null && (
+        <span className={`card__environment card__environment--${data.environment}`}>
+          {ENVIRONMENT[data.environment]}
+        </span>
+      )}
       <button className="card__fork nodrag" type="button" onClick={() => onFork(id)}>
         Fork
       </button>

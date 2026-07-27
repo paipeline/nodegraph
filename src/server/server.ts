@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
 import { readForks } from '../adapters/store.js'
+import { readEnvironments } from '../adapters/workspace.js'
 import { toFlowGraph } from '../core/flow.js'
 import { KEY_META } from '../core/guard.js'
 import { reconcile } from '../core/reconcile.js'
@@ -141,9 +142,20 @@ const readBody = (request: IncomingMessage): Promise<string> =>
     request.on('error', reject)
   })
 
-/** The Nodes as they stand right now: what git has, crossed with what we wrote down. */
-const currentNodes = async (repoPath: string) =>
-  reconcile(await readWorld(repoPath), await readForks(repoPath))
+/**
+ * The Nodes as they stand right now: what git has, crossed with what we wrote
+ * down, crossed with what each Workspace's environment is still doing. Only
+ * Forks are asked — the Trunk is the one Node nodegraph never built.
+ */
+const currentNodes = async (repoPath: string) => {
+  const forks = await readForks(repoPath)
+
+  return reconcile(
+    await readWorld(repoPath),
+    forks,
+    await readEnvironments(forks.map((fork) => fork.workspacePath)),
+  )
+}
 
 const handle = async (
   options: { repoPath: string; webRoot?: string; gate: Gate },

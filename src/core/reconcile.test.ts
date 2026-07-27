@@ -20,6 +20,7 @@ describe('reconcile', () => {
         workspacePath: '/repo',
         branch: 'main',
         parentId: null,
+        environment: 'ready',
       },
     ])
   })
@@ -77,15 +78,74 @@ describe('reconcile', () => {
     )
 
     expect(nodes).toEqual([
-      { id: 'trunk', kind: 'trunk', workspacePath: '/repo', branch: 'main', parentId: null },
+      {
+        id: 'trunk',
+        kind: 'trunk',
+        workspacePath: '/repo',
+        branch: 'main',
+        parentId: null,
+        environment: 'ready',
+      },
       {
         id: 'abc',
         kind: 'fork',
         workspacePath: '/repo/.nodegraph/workspaces/abc',
         branch: 'nodegraph/abc',
         parentId: 'trunk',
+        environment: 'ready',
       },
     ])
+  })
+
+  it('says so on the Node whose environment is still landing', () => {
+    const nodes = reconcile(
+      snapshot([
+        { path: '/repo', branch: 'main', isPrimary: true },
+        { path: '/repo/.nodegraph/workspaces/abc', branch: 'nodegraph/abc', isPrimary: false },
+      ]),
+      [
+        {
+          id: 'abc',
+          parentId: 'trunk',
+          workspacePath: '/repo/.nodegraph/workspaces/abc',
+          forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+        },
+      ],
+      { '/repo/.nodegraph/workspaces/abc': 'preparing' },
+    )
+
+    expect(nodes.map((node) => [node.id, node.environment])).toEqual([
+      ['trunk', 'ready'],
+      ['abc', 'preparing'],
+    ])
+  })
+
+  it('admits an environment that went wrong rather than showing the Node as whole', () => {
+    const nodes = reconcile(
+      snapshot([
+        { path: '/repo', branch: 'main', isPrimary: true },
+        { path: '/repo/.nodegraph/workspaces/abc', branch: 'nodegraph/abc', isPrimary: false },
+      ]),
+      [
+        {
+          id: 'abc',
+          parentId: 'trunk',
+          workspacePath: '/repo/.nodegraph/workspaces/abc',
+          forkPointSha: '0123456789abcdef0123456789abcdef01234567',
+        },
+      ],
+      { '/repo/.nodegraph/workspaces/abc': 'failed' },
+    )
+
+    expect(nodes[1]?.environment).toBe('failed')
+  })
+
+  it('never says the Trunk is preparing — nodegraph never built it', () => {
+    const nodes = reconcile(snapshot([{ path: '/repo', branch: 'main', isPrimary: true }]), [], {
+      '/repo': 'preparing',
+    })
+
+    expect(nodes[0]?.environment).toBe('ready')
   })
 
   it('drops a recorded Fork whose Workspace is no longer in the world', () => {

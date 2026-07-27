@@ -45,6 +45,70 @@ afterEach(() => {
   rmSync(repo, { recursive: true, force: true })
 })
 
+/**
+ * A real second nodegraph, forking in a process of its own. Nothing it does is
+ * in this process's memory, so what one of them can know about the other is
+ * exactly what was written down — which is the whole point of the tests that
+ * use it.
+ */
+const forkInAnotherNodegraph = (workspacePath: string) => {
+  const script = join(repo, '.nodegraph', 'prepare.mts')
+  // tsx runs the script in a process of its own, so the pid that does the work
+  // — and that a marker would name — is not the one spawn hands back here.
+  const pidFile = join(repo, '.nodegraph', 'other.pid')
+  writeFileSync(
+    script,
+    `import { writeFileSync } from 'node:fs'\n` +
+      `import { provisionWorkspace } from ${JSON.stringify(fileURLToPath(new URL('./workspace.js', import.meta.url)))}\n` +
+      `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))\n` +
+      `await provisionWorkspace({ from: ${JSON.stringify(repo)}, workspacePath: ${JSON.stringify(workspacePath)}, branch: 'nodegraph/child' })\n` +
+      `setTimeout(() => process.exit(0), 60_000)\n`,
+  )
+  const other = spawn(join(process.cwd(), 'node_modules', '.bin', 'tsx'), [script], {
+    stdio: 'ignore',
+    detached: true,
+  })
+
+  // The whole group has to go — a crash that leaves the real worker alive is
+  // not the crash under test.
+  const kill = () => {
+    try {
+      process.kill(-(other.pid ?? 0), 'SIGKILL')
+    } catch {
+      /* already gone */
+    }
+  }
+
+  return {
+    kill,
+    /**
+     * Waits until that nodegraph is really gone. A killed process goes on
+     * answering `kill(pid, 0)` until it has been reaped, so a test that means
+     * "once the nodegraph preparing it is gone" has to wait for that too.
+     */
+    whenGone: async () => {
+      const worker = Number(readFileSync(pidFile, 'utf8'))
+
+      if (other.exitCode === null && other.signalCode === null) {
+        await new Promise((exited) => other.on('exit', exited))
+      }
+
+      for (;;) {
+        try {
+          process.kill(worker, 0)
+        } catch {
+          return
+        }
+        await new Promise((wake) => setTimeout(wake, 20))
+      }
+    },
+  }
+}
+
+const waitFor = async (path: string): Promise<void> => {
+  while (!existsSync(path)) await new Promise((wake) => setTimeout(wake, 20))
+}
+
 describe('provisioning a Workspace', () => {
   it('checks out an independent worktree of the parent repository on a new branch', async () => {
     const workspacePath = join(repo, 'child')
@@ -223,6 +287,31 @@ describe('provisioning a Workspace', () => {
     expect(existsSync(join(workspacePath, 'node_modules'))).toBe(false)
   })
 
+  it('refuses to Fork at all when the on-fork hook the project wrote cannot be run', async () => {
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules/\n')
+    writeFileSync(join(repo, '.env'), 'OPENAI_KEY=parent\n')
+    mkdirSync(join(repo, 'node_modules'), { recursive: true })
+    writeFileSync(join(repo, 'node_modules', 'left-pad.js'), 'module.exports = 1\n')
+
+    // The `chmod +x` everybody forgets the first time. Skipping the hook and
+    // quietly carrying the environment instead would ignore what the project
+    // asked for; skipping both — which is what a hook detected by its mere
+    // existence does — hands over a Workspace with no environment at all and
+    // nothing to say why.
+    writeFileSync(join(repo, '.nodegraph.on-fork'), '#!/bin/sh\necho built > built-by-hook\n')
+    chmodSync(join(repo, '.nodegraph.on-fork'), 0o644)
+    const workspacePath = join(repo, 'child')
+
+    await expect(
+      provisionWorkspace({ from: repo, workspacePath, branch: 'nodegraph/child' }),
+    ).rejects.toThrow(/\.nodegraph\.on-fork.*executable/s)
+
+    // Refused before anything was built, so there is nothing to clean up.
+    expect(existsSync(workspacePath)).toBe(false)
+    expect(git(repo, 'branch', '--list', 'nodegraph/child')).toBe('')
+    expect(git(repo, 'worktree', 'list', '--porcelain')).not.toContain(workspacePath)
+  })
+
   it('hands the Workspace over while the environment is still coming', async () => {
     writeFileSync(join(repo, '.gitignore'), 'node_modules/\n.nodegraph/\n')
     mkdirSync(join(repo, 'node_modules'), { recursive: true })
@@ -318,40 +407,59 @@ describe('provisioning a Workspace', () => {
     const workspacePath = join(repo, '.nodegraph', 'workspaces', 'child')
 
     // A real second nodegraph, forking and then dying mid-preparation, read by
-    // this one. Nothing here is in that process's memory, so what is left is
-    // whatever it wrote down.
-    const script = join(repo, '.nodegraph', 'prepare.mts')
-    writeFileSync(
-      script,
-      `import { provisionWorkspace } from ${JSON.stringify(fileURLToPath(new URL('./workspace.js', import.meta.url)))}\n` +
-        `await provisionWorkspace({ from: ${JSON.stringify(repo)}, workspacePath: ${JSON.stringify(workspacePath)}, branch: 'nodegraph/child' })\n` +
-        `setTimeout(() => process.exit(0), 60_000)\n`,
-    )
-    const other = spawn(join(process.cwd(), 'node_modules', '.bin', 'tsx'), [script], {
-      stdio: 'ignore',
-      detached: true,
-    })
-    // tsx runs the script in a process of its own, so the whole group has to go
-    // — a crash that leaves the real one alive is not the crash under test.
-    const killGroup = () => {
-      try {
-        process.kill(-(other.pid ?? 0), 'SIGKILL')
-      } catch {
-        /* already gone */
-      }
-    }
+    // this one.
+    const other = forkInAnotherNodegraph(workspacePath)
 
     try {
-      while (!existsSync(started)) await new Promise((wake) => setTimeout(wake, 20))
+      await waitFor(started)
       await expect(readEnvironmentStatus(workspacePath)).resolves.toBe('preparing')
 
-      killGroup()
-      await new Promise((exited) => other.on('exit', exited))
+      other.kill()
+      await other.whenGone()
 
       // Nobody is coming back to finish it, so it must stop looking imminent.
       await expect(readEnvironmentStatus(workspacePath)).resolves.toBe('failed')
     } finally {
-      killGroup()
+      other.kill()
+    }
+  })
+
+  it('takes a Workspace away whole even when another nodegraph is the one still filling it', async () => {
+    writeFileSync(join(repo, '.gitignore'), '.nodegraph/\n')
+    mkdirSync(join(repo, '.nodegraph'), { recursive: true })
+    const started = join(repo, '.nodegraph', 'hook-started')
+    const finished = join(repo, '.nodegraph', 'hook-finished')
+
+    // The same hook as the single-process case: still writing into the
+    // Workspace, by absolute path, when it is taken away.
+    writeFileSync(
+      join(repo, '.nodegraph.on-fork'),
+      `#!/bin/sh\ntouch "${started}"\nsleep 2\nmkdir -p "$NODEGRAPH_WORKSPACE/node_modules"\necho late > "$NODEGRAPH_WORKSPACE/node_modules/index.js"\ntouch "${finished}"\n`,
+    )
+    chmodSync(join(repo, '.nodegraph.on-fork'), 0o755)
+    const workspacePath = join(repo, '.nodegraph', 'workspaces', 'child')
+
+    // This time the work belongs to a different process, so waiting for it
+    // cannot mean waiting on a promise this one is holding.
+    const other = forkInAnotherNodegraph(workspacePath)
+
+    try {
+      await waitFor(started)
+      await expect(readEnvironmentStatus(workspacePath)).resolves.toBe('preparing')
+
+      await removeWorkspace({ from: repo, workspacePath, branch: 'nodegraph/child' })
+
+      // Discard has to be believable: a Workspace that reappears seconds later,
+      // half-built and owned by nobody, is the one thing that would stop anyone
+      // daring to Discard again.
+      expect(existsSync(finished)).toBe(true)
+      expect(existsSync(workspacePath)).toBe(false)
+      expect(git(repo, 'branch', '--list', 'nodegraph/child')).toBe('')
+
+      await new Promise((wake) => setTimeout(wake, 500))
+      expect(existsSync(workspacePath)).toBe(false)
+    } finally {
+      other.kill()
     }
   })
 

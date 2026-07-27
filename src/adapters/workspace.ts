@@ -1,12 +1,25 @@
 import { execFile, spawn } from 'node:child_process'
 import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import {
+  carriedAdditions,
+  gitDirOf,
+  NO_ENVIRONMENT,
+  readHookVerdict,
+  splitEnvironment,
+  statusFromMarker,
+  type Environment,
+  type EnvironmentStatus,
+} from '../core/environment.js'
 import { homeOf } from './store.js'
 
 /**
  * Builds and tears down the code half of a Node: a git worktree of its own,
  * cut from the parent Node's Workspace.
+ *
+ * Everything here is I/O — git, the filesystem, the project's own hook. The
+ * rules about what any of it means live in `core/environment.ts`.
  */
 
 const run = promisify(execFile)
@@ -20,17 +33,7 @@ export type ProvisionRequest = {
   branch: string
 }
 
-/**
- * Where a Workspace's environment has got to. A Node whose environment is still
- * `preparing` is one the agent can already read and edit code in — only the
- * heavy directories are still landing.
- */
-export type EnvironmentStatus = 'preparing' | 'ready' | 'failed'
-
-/** The ignored paths of a Workspace, split by what they cost to carry. */
-type Environment = { files: string[]; directories: string[] }
-
-const NOTHING: Environment = { files: [], directories: [] }
+export type { EnvironmentStatus }
 
 export type ProvisionedWorkspace = {
   workspacePath: string
@@ -50,66 +53,35 @@ const git = async (cwd: string, args: string[]): Promise<string> => {
 const zeroSeparated = (stdout: string): string[] =>
   stdout.split('\0').filter((entry) => entry !== '')
 
-/**
- * Every worktree of this repository, as absolute paths. Workspaces live inside
- * the repository they were cut from — nodegraph's own under `.nodegraph/`, and
- * other tools keep theirs in directories of their own — and those directories
- * are ignored, which is exactly what makes them look like environment. They are
- * not: each is a whole checkout of another Node, and carrying one would copy
- * every sibling Node into this one, then their copies into the next Fork.
- */
+/** Every worktree of this repository, as absolute paths. */
 const worktreePaths = async (from: string): Promise<string[]> =>
   (await git(from, ['worktree', 'list', '--porcelain']))
     .split('\n')
     .filter((line) => line.startsWith('worktree '))
     .map((line) => resolve(line.slice('worktree '.length)))
 
-const holdsAWorktree = (candidate: string, worktrees: string[]): boolean =>
-  worktrees.some((worktree) => worktree === candidate || worktree.startsWith(candidate + sep))
-
 /**
- * The environment: everything the parent Workspace needs in order to run that
- * git deliberately does not track — `.env`, `node_modules`, `target`, `.venv`.
- * A child Node that inherits the code but not these cannot be worked in, so its
- * agent's first act would be to build them all over again.
- *
- * `--directory` collapses a wholly ignored directory into one entry, which is
- * also the line drawn here: an ignored *file* is small and copied before Fork
- * returns; an ignored *directory* is an environment and goes to the background.
- * Listing it any other way would walk every file in `node_modules` first.
+ * What the parent Workspace needs in order to run that git does not track,
+ * asked of git and sorted by `splitEnvironment`. `--directory` collapses a
+ * wholly ignored directory into one entry — listing it any other way would walk
+ * every file in `node_modules` first.
  */
-const readIgnoredEntries = async (from: string): Promise<Environment> => {
-  const worktrees = await worktreePaths(from)
-  const entries = zeroSeparated(
-    await git(from, [
-      'ls-files',
-      '--others',
-      '--ignored',
-      '--exclude-standard',
-      '--directory',
-      '-z',
-    ]),
-  )
-
-  const directories = entries.filter((entry) => entry.endsWith('/'))
-
-  return {
-    // git reports a wholly ignored directory *and* the ignored files inside it.
-    // Copying both would land the directory inside its own copy.
-    files: entries.filter(
-      (entry) =>
-        !entry.endsWith('/') && !directories.some((directory) => entry.startsWith(directory)),
+const readIgnoredEntries = async (from: string): Promise<Environment> =>
+  splitEnvironment({
+    from,
+    entries: zeroSeparated(
+      await git(from, [
+        'ls-files',
+        '--others',
+        '--ignored',
+        '--exclude-standard',
+        '--directory',
+        '-z',
+      ]),
     ),
-    directories: directories
-      .map((entry) => resolve(from, entry.slice(0, -1)))
-      // nodegraph's home is ignored like any environment directory and is
-      // nothing of the sort: on the first Fork it holds only the graph, which
-      // a child must not carry a stale second copy of, and on every Fork after
-      // that it holds the other Nodes' Workspaces.
-      .filter((entry) => entry !== homeOf(from) && !holdsAWorktree(entry, worktrees))
-      .map((entry) => relative(from, entry)),
-  }
-}
+    home: homeOf(from),
+    worktrees: await worktreePaths(from),
+  })
 
 /**
  * An environment directory, copied the cheapest way the filesystem allows.
@@ -138,22 +110,32 @@ const cloneDirectory = async (source: string, destination: string): Promise<void
 
 /**
  * The one place a project gets to say "my environment is not a pile of files".
- * An executable at this path in the parent Workspace replaces everything above:
+ * An executable at this path in the parent Workspace replaces everything else:
  * no ignored file is copied, no directory is cloned, the hook is simply run
  * inside the new Workspace and the environment is whatever it leaves behind.
- * Half-doing both would be the worst of it — a project that knows how to build
- * its own environment does not want ours underneath.
  *
  * It runs with the same reach as the agent that is about to be started in the
- * same Workspace, so it grants nobody anything they did not already have.
+ * same Workspace, so it grants nobody anything they did not already have — but
+ * only if it can be run at all. A file there that cannot is refused rather than
+ * handed to a process or quietly stepped around: see `readHookVerdict`.
  */
 const ON_FORK = '.nodegraph.on-fork'
 
 const onForkHook = async (from: string): Promise<string | undefined> => {
   const hook = join(from, ON_FORK)
   const found = await stat(hook).catch(() => undefined)
+  const verdict = readHookVerdict(
+    found === undefined ? undefined : { isFile: found.isFile(), mode: found.mode },
+  )
 
-  return found?.isFile() === true ? hook : undefined
+  if (verdict === 'not-executable') {
+    throw new Error(
+      `${ON_FORK} is not executable, so this Fork would arrive with no environment at all. ` +
+        `Run: chmod +x ${hook}`,
+    )
+  }
+
+  return verdict === 'run' ? hook : undefined
 }
 
 const runHook = async (hook: string, from: string, workspacePath: string): Promise<void> => {
@@ -206,8 +188,17 @@ const preparing = new Map<string, Promise<EnvironmentStatus>>()
  */
 const MARKER = 'nodegraph-environment.json'
 
-const markerPath = async (workspacePath: string): Promise<string> =>
-  join((await git(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim(), MARKER)
+const markerPath = async (workspacePath: string): Promise<string> => {
+  // Every linked worktree keeps a `.git` file pointing at its own admin
+  // directory, and reading it beats spawning a git for every Node on every
+  // poll. Anything else — a real `.git` directory, a file we do not recognise
+  // — and git is asked properly.
+  const link = await readFile(join(workspacePath, '.git'), 'utf8').catch(() => undefined)
+  const gitDir = link === undefined ? undefined : gitDirOf(workspacePath, link)
+  const asked = gitDir ?? (await git(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim()
+
+  return join(asked, MARKER)
+}
 
 const recordEnvironment = async (
   workspacePath: string,
@@ -238,22 +229,27 @@ const stillRunning = (pid: number): boolean => {
 
 /** What a Workspace's environment is doing, as anyone can read it off disk. */
 export const readEnvironmentStatus = async (workspacePath: string): Promise<EnvironmentStatus> => {
-  let marker: { status?: EnvironmentStatus; owner?: number }
+  let marker: unknown
   try {
-    marker = JSON.parse(await readFile(await markerPath(workspacePath), 'utf8')) as typeof marker
+    marker = JSON.parse(await readFile(await markerPath(workspacePath), 'utf8'))
   } catch {
     // No marker is how a settled Workspace looks, and the only way a Workspace
     // nodegraph never touched can look.
     return 'ready'
   }
 
-  if (marker.status !== 'preparing') return marker.status ?? 'ready'
-
-  // A Node that says "preparing" for ever, because the nodegraph doing the
-  // preparing was killed, is worse than one that admits it went wrong: the
-  // first is waited on, the second is Discarded and forked again.
-  return marker.owner !== undefined && !stillRunning(marker.owner) ? 'failed' : 'preparing'
+  return statusFromMarker(marker, stillRunning)
 }
+
+/** The same answer for a whole graph's worth of Workspaces, keyed by path. */
+export const readEnvironments = async (
+  workspacePaths: string[],
+): Promise<Record<string, EnvironmentStatus>> =>
+  Object.fromEntries(
+    await Promise.all(
+      workspacePaths.map(async (path) => [path, await readEnvironmentStatus(path)] as const),
+    ),
+  )
 
 const prepareInBackground = (
   workspacePath: string,
@@ -273,13 +269,30 @@ const prepareInBackground = (
   return settled
 }
 
+const SETTLING_POLL_MS = 50
+
+const pause = (ms: number): Promise<void> => new Promise((wake) => setTimeout(wake, ms))
+
 /**
- * Waits for whatever this process is still doing to a Workspace's environment.
- * A Workspace nobody here is preparing has already settled, so this answers at
- * once — from disk, since the work may have been another nodegraph's.
+ * Waits until nothing is still filling a Workspace's environment.
+ *
+ * The work is usually this process's own, and then the promise is right here.
+ * When it is not — a second nodegraph, or this one before a restart — the only
+ * handle anybody has on it is the marker that process left, so this waits for
+ * that to stop saying `preparing`. Reading it once and carrying on regardless
+ * is exactly how a Workspace gets torn down under a live writer and reappears a
+ * second later. The wait always ends: a preparer that dies is read as `failed`.
  */
-export const whenEnvironmentSettles = async (workspacePath: string): Promise<EnvironmentStatus> =>
-  (await preparing.get(workspacePath)) ?? readEnvironmentStatus(workspacePath)
+export const whenEnvironmentSettles = async (workspacePath: string): Promise<EnvironmentStatus> => {
+  const ours = preparing.get(workspacePath)
+  if (ours !== undefined) return ours
+
+  for (;;) {
+    const status = await readEnvironmentStatus(workspacePath)
+    if (status !== 'preparing') return status
+    await pause(SETTLING_POLL_MS)
+  }
+}
 
 export const provisionWorkspace = async ({
   from,
@@ -293,15 +306,15 @@ export const provisionWorkspace = async ({
   // The patch covers every tracked change — edits, deletions and renames — and
   // the untracked list covers everything the parent has added since.
   const patch = await git(from, ['diff', 'HEAD', '--binary'])
-  const worktrees = await worktreePaths(from)
-  // A Workspace need not be ignored to be sitting in the parent's tree: git
-  // reports another worktree as one untracked entry, and copying it would carry
-  // a whole Node in as a pile of files.
-  const added = zeroSeparated(
-    await git(from, ['ls-files', '--others', '--exclude-standard', '-z']),
-  ).filter((entry) => !holdsAWorktree(resolve(from, entry), worktrees))
+  const added = carriedAdditions({
+    from,
+    entries: zeroSeparated(await git(from, ['ls-files', '--others', '--exclude-standard', '-z'])),
+    worktrees: await worktreePaths(from),
+  })
+  // Asked before the Workspace exists: a hook that cannot be run stops the Fork
+  // here, where there is nothing yet to leave behind.
   const hook = await onForkHook(from)
-  const ignored = hook === undefined ? await readIgnoredEntries(from) : NOTHING
+  const ignored = hook === undefined ? await readIgnoredEntries(from) : NO_ENVIRONMENT
 
   await git(from, ['worktree', 'add', '-q', '-b', branch, workspacePath, forkPointSha])
 
@@ -360,7 +373,8 @@ export const removeWorkspace = async ({
   branch: string
 }): Promise<void> => {
   // Nothing may still be writing into a Workspace that is being taken away, or
-  // it reappears a second later, half a Workspace, owned by nobody.
+  // it reappears a second later, half a Workspace, owned by nobody — whether
+  // the writer is this nodegraph or another one.
   await whenEnvironmentSettles(workspacePath)
   preparing.delete(workspacePath)
 

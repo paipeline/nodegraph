@@ -8,6 +8,7 @@ const trunk: NodeView = {
   workspacePath: '/repo',
   branch: 'main',
   parentId: null,
+  environment: 'ready',
 }
 
 describe('toFlowGraph', () => {
@@ -25,9 +26,26 @@ describe('toFlowGraph', () => {
           kind: 'trunk',
           branch: 'main',
           workspacePath: '/repo',
+          environment: 'ready',
         },
       },
     ])
+  })
+
+  it('hands the browser the environment status so a Node can show it', () => {
+    const graph = toFlowGraph([
+      trunk,
+      {
+        id: 'abc',
+        kind: 'fork',
+        workspacePath: '/repo/.nodegraph/workspaces/abc',
+        branch: 'nodegraph/abc',
+        parentId: 'trunk',
+        environment: 'preparing',
+      },
+    ])
+
+    expect(graph.nodes[1]?.data.environment).toBe('preparing')
   })
 
   it('labels a detached Trunk without pretending it has a branch', () => {

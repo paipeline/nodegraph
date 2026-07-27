@@ -14,6 +14,7 @@ export type FlowNode = {
     kind: NodeView['kind']
     branch: string | null
     workspacePath: string
+    environment: NodeView['environment']
   }
   /** Owned by the browser, never by the server. */
   selected?: boolean
@@ -42,6 +43,7 @@ export const toFlowGraph = (nodes: NodeView[]): FlowGraph => ({
       kind: node.kind,
       branch: node.branch,
       workspacePath: node.workspacePath,
+      environment: node.environment,
     },
   })),
   edges: nodes.flatMap((node) =>
