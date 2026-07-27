@@ -172,7 +172,10 @@ const handle = async (
   }
 
   // How far each Node has come, measured against the fork point recorded when
-  // it was forked. A read: it changes nothing and takes no key.
+  // it was forked. It changes nothing, but it is not a read of nodegraph's own
+  // bookkeeping either — it walks the user's working tree and reads the files
+  // in it — so it takes this run's key. See ADR-0004; the gate has already
+  // turned away anyone without one by the time we are here.
   if (pathname === '/api/diffs') {
     json(response, 200, { diffs: await readDiffs(options.repoPath) })
     return

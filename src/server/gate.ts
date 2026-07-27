@@ -48,6 +48,14 @@ const keyOffered = (request: IncomingMessage, kind: Attempt['kind']): string | n
   return typeof offered === 'string' ? offered : null
 }
 
+/**
+ * What is being asked for, with the query string taken off. Parsed against a
+ * fixed base so a caller cannot smuggle an absolute url past it, and read here
+ * rather than in `core/guard` because pulling facts off the wire is edge work.
+ */
+const pathAsked = (request: IncomingMessage): string =>
+  new URL(request.url ?? '/', 'http://127.0.0.1').pathname
+
 export const openGate = (server: Server): Gate => {
   const key = mintKey()
 
@@ -58,6 +66,7 @@ export const openGate = (server: Server): Gate => {
         {
           kind,
           method: request.method ?? 'GET',
+          path: pathAsked(request),
           origin: request.headers.origin ?? null,
           key: keyOffered(request, kind),
         },

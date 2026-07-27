@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { branchOf, forkRecord, workspaceOf } from '../core/store.js'
 import { reconcile } from '../core/reconcile.js'
 import { readWorld } from './git.js'
 import { prepareHome, readForks, recordFork, type StoredFork } from './store.js'
@@ -16,13 +16,14 @@ export type ForkRequest = {
   parentId: string
 }
 
-const WORKSPACES = 'workspaces'
-
 export const fork = async ({ repoPath, parentId }: ForkRequest): Promise<StoredFork> => {
   const world = await readWorld(repoPath)
   const parent = reconcile(world, await readForks(repoPath)).find((node) => node.id === parentId)
   if (parent === undefined) throw new Error(`No Node ${parentId} to fork from`)
 
+  // Eight hex digits, which is the name `core/store` will insist on when this
+  // record is read back — the branch and the Workspace are named after it there
+  // too, so a Node's name is the only thing that has to be invented here.
   const id = randomUUID().slice(0, 8)
   // The home has to exist and ignore itself before the Workspace lands inside
   // it, or the parent would see the child as a pile of untracked files.
@@ -30,18 +31,17 @@ export const fork = async ({ repoPath, parentId }: ForkRequest): Promise<StoredF
 
   const workspace = await provisionWorkspace({
     from: parent.workspacePath,
-    workspacePath: join(home, WORKSPACES, id),
-    branch: `nodegraph/${id}`,
+    workspacePath: workspaceOf(home, id),
+    branch: branchOf(id),
   })
 
-  const child: StoredFork = {
+  const child = forkRecord({
     id,
     parentId,
-    branch: workspace.branch,
-    workspacePath: workspace.workspacePath,
+    home,
     forkPointSha: workspace.forkPointSha,
     createdAt: new Date().toISOString(),
-  }
+  })
 
   try {
     await recordFork(repoPath, child)

@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process'
 import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import {
   addedWhole,
   changedUnmeasured,
@@ -11,7 +9,7 @@ import {
   type DiffSummary,
 } from '../core/diff.js'
 import { reconcile } from '../core/reconcile.js'
-import { readWorld } from './git.js'
+import { readWorld, runGit } from './git.js'
 import { readForks } from './store.js'
 
 /**
@@ -23,13 +21,6 @@ import { readForks } from './store.js'
  * committing something new must not move either number.
  */
 
-const run = promisify(execFile)
-
-const git = async (cwd: string, args: string[]): Promise<string> => {
-  const { stdout } = await run('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 })
-  return stdout
-}
-
 /**
  * How much untracked content one Node's diff will read to count lines in.
  * Generous for source, and a hard stop for the dataset somebody forgot to
@@ -38,6 +29,11 @@ const git = async (cwd: string, args: string[]): Promise<string> => {
 const MEASURE_BUDGET = 4 * 1024 * 1024
 
 export type DiffRequest = {
+  /**
+   * The Workspace to measure — a directory git has itself just named as a
+   * worktree of this repository, never a string that came out of the store.
+   * See `readDiffs` below, and `core/store` for why the difference matters.
+   */
   workspacePath: string
   forkPointSha: string
 }
@@ -49,7 +45,7 @@ export type DiffRequest = {
  * — Workspaces and all — from being counted as somebody's work.
  */
 const readAdded = async (workspacePath: string): Promise<FileChange[]> => {
-  const listing = await git(workspacePath, ['ls-files', '--others', '--exclude-standard', '-z'])
+  const listing = await runGit(workspacePath, ['ls-files', '--others', '--exclude-standard', '-z'])
   const paths = listing.split('\0').filter((path) => path !== '')
 
   const added: FileChange[] = []
@@ -95,10 +91,17 @@ export const readDiff = async ({
   // report nothing wrong. The separator says: whatever follows is a commit,
   // even if it is spelled like an instruction. `--` closes the same door on
   // the paths side.
-  const numstat = await git(workspacePath, [
+  //
+  // `--no-ext-diff` and `--no-textconv` are the diff-shaped half of what
+  // `runGit` says globally: `diff.external` and a textconv filter are both
+  // commands the repository can ask git to run, and counting lines is not a
+  // thing that needs anybody's program run to do it.
+  const numstat = await runGit(workspacePath, [
     'diff',
     '--numstat',
     '-z',
+    '--no-ext-diff',
+    '--no-textconv',
     '--end-of-options',
     forkPointSha,
     '--',
@@ -113,30 +116,36 @@ export const readDiff = async ({
  * The baseline comes out of the store, where it was written at the instant the
  * Fork happened. The Trunk was never forked from anything, so it has no fork
  * point and no diff — it is the thing the others are compared against.
+ *
+ * The *directory* does not come out of the store. It comes off the Nodes the
+ * graph is actually showing, which `reconcile` builds from git's own list of
+ * this repository's worktrees — so the only place git is ever started is a
+ * Workspace of the repository the user opened. A filter that asked instead
+ * "is this record's Node on the graph?" and then used the record's own path
+ * would be no filter at all: a record only has to wear a drawn Node's name to
+ * be waved through, and `trunk` is a name every graph has.
  */
 export const readDiffs = async (repoPath: string): Promise<NodeDiff[]> => {
   const forks = await readForks(repoPath)
-  const drawn = new Set(reconcile(await readWorld(repoPath), forks).map((node) => node.id))
+  const forkPoints = new Map(forks.map((fork) => [fork.id, fork.forkPointSha]))
 
   const measured = await Promise.all(
-    forks
-      .filter((each) => drawn.has(each.id))
-      .map(async (each): Promise<NodeDiff | null> => {
-        try {
-          return {
-            nodeId: each.id,
-            ...(await readDiff({
-              workspacePath: each.workspacePath,
-              forkPointSha: each.forkPointSha,
-            })),
-          }
-        } catch {
-          // A Workspace deleted from a terminal, a fork point that has been
-          // gc'd away: one Node nobody can measure is one Node with no
-          // numbers, not a graph where every Node loses its numbers.
-          return null
+    reconcile(await readWorld(repoPath), forks).map(async (node): Promise<NodeDiff | null> => {
+      const forkPointSha = forkPoints.get(node.id)
+      if (forkPointSha === undefined) return null
+
+      try {
+        return {
+          nodeId: node.id,
+          ...(await readDiff({ workspacePath: node.workspacePath, forkPointSha })),
         }
-      }),
+      } catch {
+        // A Workspace deleted from a terminal, a fork point that has been
+        // gc'd away: one Node nobody can measure is one Node with no
+        // numbers, not a graph where every Node loses its numbers.
+        return null
+      }
+    }),
   )
 
   return measured.filter((diff): diff is NodeDiff => diff !== null)

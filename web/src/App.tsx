@@ -57,7 +57,13 @@ export const App = () => {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
   const load = useCallback(async () => {
-    const [response, measured] = await Promise.all([fetch('/api/graph'), fetch('/api/diffs')])
+    // The graph itself is nodegraph's own bookkeeping and goes unlocked so the
+    // page can draw at all; the diffs are read out of the user's own files, so
+    // that poll carries this run's key. ADR-0004.
+    const [response, measured] = await Promise.all([
+      fetch('/api/graph'),
+      fetch('/api/diffs', { headers: { [KEY_HEADER]: runKey() } }),
+    ])
     if (!response.ok) throw new Error(`Server answered ${response.status}`)
     if (!measured.ok) throw new Error(`Server answered ${measured.status}`)
     const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }

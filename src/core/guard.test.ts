@@ -7,7 +7,7 @@ const KEY = 'kAtLA0jVCvpqvIvbCUyDsmZ8u3q0Ym5ROzVfeFAcvXQ'
 const trust = { ownOrigins: OURS, key: KEY }
 
 /** A caller doing everything right, so each test can change one thing about it. */
-const honest = { kind: 'http', method: 'POST', origin: OURS[0], key: KEY } as const
+const honest = { kind: 'http', method: 'POST', path: '/api/fork', origin: OURS[0], key: KEY } as const
 
 describe('deciding who may reach a running nodegraph', () => {
   it('lets a caller in when it is this very server and holds this run’s key', () => {
@@ -83,7 +83,7 @@ describe('deciding who may reach a running nodegraph', () => {
   it('turns away a caller attaching to an agent without this run’s key', () => {
     // A websocket is never a read, whatever method the upgrade was spelled with.
     expect(
-      admit({ kind: 'websocket', method: 'GET', origin: null, key: null }, trust),
+      admit({ kind: 'websocket', method: 'GET', path: '/session', origin: null, key: null }, trust),
     ).toMatchObject({ allowed: false })
   })
 
@@ -91,9 +91,30 @@ describe('deciding who may reach a running nodegraph', () => {
     // The browser's own same-origin policy is what keeps another site from
     // reading these; a key here would only lock the user out of their own page.
     for (const method of ['GET', 'HEAD']) {
-      expect(admit({ kind: 'http', method, origin: null, key: null }, trust)).toEqual({
-        allowed: true,
-      })
+      for (const path of ['/api/nodes', '/api/graph', '/', '/assets/app.js']) {
+        expect(admit({ kind: 'http', method, path, origin: null, key: null }, trust)).toEqual({
+          allowed: true,
+        })
+      }
+    }
+  })
+
+  /**
+   * ADR-0004. What the same-origin policy protects is the answer, not the work
+   * done to make it: a `<script src>` or an `<img src>` reaches a handler with
+   * no Origin header at all, and the handler runs whether or not the page that
+   * asked can read a word of what comes back. So a read that goes and reads the
+   * user's own files — rather than reporting what nodegraph already knows about
+   * itself — asks for this run's key like anything else that costs something.
+   */
+  it('asks for the key before it goes and reads the user’s own files', () => {
+    for (const method of ['GET', 'HEAD']) {
+      expect(
+        admit({ kind: 'http', method, path: '/api/diffs', origin: null, key: null }, trust),
+      ).toMatchObject({ allowed: false })
+      expect(
+        admit({ kind: 'http', method, path: '/api/diffs', origin: OURS[0], key: KEY }, trust),
+      ).toEqual({ allowed: true })
     }
   })
 

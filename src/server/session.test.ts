@@ -176,4 +176,39 @@ describe('the terminal behind a Node', () => {
     await settle(() => expect(viewer.frames[0]).toMatchObject({ type: 'error' }))
     await settle(() => expect(viewer.socket.readyState).toBe(WebSocket.CLOSED))
   })
+
+  /**
+   * The other place a Workspace becomes the directory a process is started in.
+   * `graph.json` sits in the user's repository, so it can name anywhere; a Node
+   * is only ever a directory git listed as a worktree of this repository, so a
+   * record naming anywhere else opens no terminal — not even wearing the
+   * Trunk's own name, which every graph has and so is the easiest one to wear.
+   */
+  it('opens an agent only in a Workspace git has, whatever the store says', async () => {
+    const elsewhere = join(sandbox, 'elsewhere')
+    mkdirSync(elsewhere)
+    mkdirSync(join(repo, '.nodegraph'), { recursive: true })
+    const borrowed = {
+      parentId: 'trunk',
+      workspacePath: elsewhere,
+      forkPointSha: git(repo, 'rev-parse', 'HEAD'),
+      createdAt: '2026-07-27T09:00:00.000Z',
+    }
+    writeFileSync(
+      join(repo, '.nodegraph', 'graph.json'),
+      JSON.stringify({
+        forks: [
+          { ...borrowed, id: 'trunk', branch: 'nodegraph/trunk' },
+          { ...borrowed, id: 'a1b2c3d4', branch: 'nodegraph/a1b2c3d4' },
+        ],
+      }),
+    )
+
+    const stranger = view('a1b2c3d4')
+    await settle(() => expect(stranger.frames[0]).toMatchObject({ type: 'error' }))
+
+    const trunk = view('trunk')
+    await settle(() => expect(trunk.screen()).toContain(`CWD[${repo}]`))
+    expect(trunk.screen()).not.toContain(elsewhere)
+  })
 })

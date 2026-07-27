@@ -24,6 +24,7 @@ import { fork } from './fork.js'
  */
 
 let repo: string
+let elsewhere: string
 let forkPoint: string
 
 const git = (cwd: string, ...args: string[]) =>
@@ -31,6 +32,7 @@ const git = (cwd: string, ...args: string[]) =>
 
 beforeEach(() => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-diff-')))
+  elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-elsewhere-')))
   git(repo, 'init', '-b', 'main', '-q')
   git(repo, 'config', 'user.email', 'test@example.com')
   git(repo, 'config', 'user.name', 'Test')
@@ -42,6 +44,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true })
+  rmSync(elsewhere, { recursive: true, force: true })
 })
 
 describe('the diff of a Node against its fork point', () => {
@@ -214,7 +217,8 @@ describe('the diff of a Node against its fork point', () => {
 /**
  * The store is a json file inside the repository being viewed, so what comes
  * out of it is whatever is on disk — a hand-edit, a bad merge, or a graph.json
- * committed to a repository somebody cloned. Its fields become git's argv.
+ * committed to a repository somebody cloned. Its fields become git's argv and
+ * git's working directory.
  */
 describe('a store that says something nodegraph never wrote', () => {
   const rewriteStore = (forks: unknown[]): void => {
@@ -227,6 +231,31 @@ describe('a store that says something nodegraph never wrote', () => {
         forks: Record<string, unknown>[]
       }
     ).forks
+
+  /** Somebody else's repository, sitting where the user's repository can name it. */
+  const anotherRepository = (at: string): string => {
+    mkdirSync(at, { recursive: true })
+    git(at, 'init', '-b', 'main', '-q')
+    git(at, 'config', 'user.email', 'test@example.com')
+    git(at, 'config', 'user.name', 'Test')
+    writeFileSync(join(at, 'vendored.txt'), 'x\n')
+    git(at, 'add', '.')
+    git(at, 'commit', '-qm', 'vendored')
+    return git(at, 'rev-parse', 'HEAD')
+  }
+
+  /**
+   * A record wearing the name of a Node the graph really draws, so a filter that
+   * asks only "is this Node on the graph?" waves it through.
+   */
+  const borrowing = (id: string, workspacePath: string, forkPointSha: string) => ({
+    id,
+    parentId: TRUNK_ID,
+    branch: `nodegraph/${id}`,
+    workspacePath,
+    forkPointSha,
+    createdAt: '2026-07-27T09:00:00.000Z',
+  })
 
   it('cannot make measuring a Node write over a file in the repository', async () => {
     // A real Fork, so git really has the Workspace and the graph really draws it.
@@ -257,6 +286,83 @@ describe('a store that says something nodegraph never wrote', () => {
     await expect(readDiffs(repo)).resolves.toEqual([
       { nodeId: believed.id, files: 1, insertions: 1, deletions: 0 },
     ])
+  })
+
+  // A Workspace is where git is *run*, which is a bigger thing to be handed than
+  // an argument: everything git decides from then on — which repository it is
+  // in, which config it obeys — it decides from there. So the directory has to
+  // be one git itself listed as a Workspace of this repository, never a string
+  // the store happened to carry. Borrowing the name of a Node that is drawn is
+  // the way past a filter that asks about the name and then uses the string.
+  it('measures the Workspace git has, never a directory the store points at', async () => {
+    const child = await fork({ repoPath: repo, parentId: TRUNK_ID })
+    writeFileSync(join(child.workspacePath, 'a.txt'), 'one\ntwo\nthree\nfour\n')
+
+    const vendored = join(elsewhere, 'vendor', 'somedep')
+    const head = anotherRepository(vendored)
+    writeFileSync(join(vendored, 'notes.txt'), 'a\nb\nc\nd\ne\n')
+
+    rewriteStore([
+      ...storedForks(),
+      borrowing(TRUNK_ID, vendored, head),
+      borrowing(child.id, vendored, head),
+    ])
+
+    // Only the real Node, and only its own numbers: nothing of the other
+    // repository's five untracked lines reaches the graph.
+    await expect(readDiffs(repo)).resolves.toEqual([
+      { nodeId: child.id, files: 1, insertions: 1, deletions: 0 },
+    ])
+  })
+
+  /**
+   * `core.fsmonitor` names a command git runs, and git takes it from the config
+   * of whatever repository it finds where it was started. So a Workspace path
+   * out of the store is not a leak of numbers — it is a command, run by the one
+   * route the page polls every two seconds.
+   */
+  it('never runs the command the config of a directory the store points at names', async () => {
+    const child = await fork({ repoPath: repo, parentId: TRUNK_ID })
+
+    const vendored = join(elsewhere, 'vendor', 'somedep')
+    const head = anotherRepository(vendored)
+    const ran = join(elsewhere, 'it-ran')
+    const payload = join(elsewhere, 'payload.sh')
+    writeFileSync(payload, `#!/bin/sh\nprintf 'ran\\n' >> "${ran}"\n`)
+    chmodSync(payload, 0o755)
+    git(vendored, 'config', 'core.fsmonitor', payload)
+
+    rewriteStore([
+      ...storedForks(),
+      borrowing(TRUNK_ID, vendored, head),
+      borrowing(child.id, vendored, head),
+    ])
+
+    await readDiffs(repo)
+
+    expect(existsSync(ran)).toBe(false)
+  })
+
+  /**
+   * The same knob, in the one repository nodegraph is entitled to run git in.
+   * The user chose to open this repository, so its config is theirs — but a
+   * command run on a two-second poll, by a background process the user is not
+   * watching, is not what they chose. Every git nodegraph runs says so.
+   */
+  it('runs no command the repository it was pointed at names for git either', async () => {
+    const child = await fork({ repoPath: repo, parentId: TRUNK_ID })
+    writeFileSync(join(child.workspacePath, 'a.txt'), 'one\ntwo\nthree\nfour\n')
+
+    const ran = join(elsewhere, 'it-ran')
+    const payload = join(elsewhere, 'payload.sh')
+    writeFileSync(payload, `#!/bin/sh\nprintf 'ran\\n' >> "${ran}"\n`)
+    chmodSync(payload, 0o755)
+    git(repo, 'config', 'core.fsmonitor', payload)
+
+    await expect(readDiffs(repo)).resolves.toEqual([
+      { nodeId: child.id, files: 1, insertions: 1, deletions: 0 },
+    ])
+    expect(existsSync(ran)).toBe(false)
   })
 })
 

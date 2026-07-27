@@ -1,14 +1,12 @@
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { cp, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { promisify } from 'node:util'
+import { gitSpawn, runGit } from './git.js'
 
 /**
  * Builds and tears down the code half of a Node: a git worktree of its own,
  * cut from the parent Node's Workspace.
  */
-
-const run = promisify(execFile)
 
 export type ProvisionRequest = {
   /** The parent Node's Workspace — the state being forked from. */
@@ -30,20 +28,16 @@ export type ProvisionedWorkspace = {
 }
 
 /**
- * Every variable this file hands git is followed by `--end-of-options`, so git
+ * Every variable this file hands git is preceded by `--end-of-options`, so git
  * reads it as the name it is and never as an option. The branch and the path
  * are nodegraph's own today, but a Discard will read both back out of the store
  * — a file in the user's repository — and the door has to be shut before it is
  * walked through, not after.
  */
-const git = async (cwd: string, args: string[]): Promise<string> => {
-  const { stdout } = await run('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 })
-  return stdout
-}
-
 const applyPatch = (cwd: string, patch: string): Promise<void> =>
   new Promise((resolve, reject) => {
-    const applying = spawn('git', ['apply', '--binary', '-'], { cwd })
+    const hardened = gitSpawn(['apply', '--binary', '-'])
+    const applying = spawn('git', hardened.args, { cwd, env: hardened.env })
     let stderr = ''
 
     applying.stderr.on('data', (chunk: Buffer) => {
@@ -61,30 +55,34 @@ export const provisionWorkspace = async ({
   workspacePath,
   branch,
 }: ProvisionRequest): Promise<ProvisionedWorkspace> => {
-  const forkPointSha = (await git(from, ['rev-parse', 'HEAD'])).trim()
+  const forkPointSha = (await runGit(from, ['rev-parse', 'HEAD'])).trim()
 
   // Read the parent's uncommitted state *before* the child exists, so what the
   // child receives is the parent as it was at the instant Fork was pressed.
   // The patch covers every tracked change — edits, deletions and renames — and
   // the untracked list covers everything the parent has added since.
-  const patch = await git(from, ['diff', 'HEAD', '--binary'])
-  const added = (await git(from, ['ls-files', '--others', '--exclude-standard', '-z']))
+  const patch = await runGit(from, ['diff', 'HEAD', '--binary'])
+  const added = (await runGit(from, ['ls-files', '--others', '--exclude-standard', '-z']))
     .split('\0')
     .filter((path) => path !== '')
 
-  await git(from, [
-    'worktree',
-    'add',
-    '-q',
-    '-b',
-    branch,
-    '--end-of-options',
-    workspacePath,
-    forkPointSha,
-  ])
+  // Two commands, not `worktree add -b`, because `-b` is the one argument git
+  // reads twice: it takes the value and hands it on to be parsed as `git
+  // branch`'s own arguments, so a branch named `-m` renames the repository's
+  // branch out from under it and `-d` tries to delete one. A separator after
+  // `-b` is already too late. Made as a branch first, on its own, git will only
+  // read the name as a name — and says so instead of doing it.
+  await runGit(from, ['branch', '--end-of-options', branch, forkPointSha])
 
-  // From here on the Workspace exists, so a failure has to undo it: a Fork that
+  // From here on the branch exists, so a failure has to undo it: a Fork that
   // did not finish must leave nothing behind at all.
+  try {
+    await runGit(from, ['worktree', 'add', '-q', '--end-of-options', workspacePath, branch])
+  } catch (cause) {
+    await runGit(from, ['branch', '-D', '--end-of-options', branch])
+    throw cause
+  }
+
   try {
     if (patch !== '') await applyPatch(workspacePath, patch)
 
@@ -114,6 +112,6 @@ export const removeWorkspace = async ({
   workspacePath: string
   branch: string
 }): Promise<void> => {
-  await git(from, ['worktree', 'remove', '--force', '--end-of-options', workspacePath])
-  await git(from, ['branch', '-D', '--end-of-options', branch])
+  await runGit(from, ['worktree', 'remove', '--force', '--end-of-options', workspacePath])
+  await runGit(from, ['branch', '-D', '--end-of-options', branch])
 }
