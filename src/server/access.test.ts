@@ -1,5 +1,8 @@
 import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
+import { connect, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'ws'
@@ -31,6 +34,7 @@ const EVIL = 'https://evil.example'
  * up in logs, in Referer and in the user's history.
  */
 const keyProtocol = (key: string) => `nodegraph.key.${key}`
+const SESSION_PROTOCOL = 'nodegraph'
 const KEY_HEADER = 'x-nodegraph-key'
 const KEY_META = 'nodegraph-key'
 
@@ -43,6 +47,7 @@ let originalPath: string | undefined
 let url: string
 let stop: (() => Promise<void>) | undefined
 const opened: WebSocket[] = []
+const rawSockets: Socket[] = []
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -98,6 +103,88 @@ const keyFromPage = async (): Promise<string> => {
   return found[1]
 }
 
+/**
+ * Whether the key is in there — asked as a yes/no on purpose. `toContain`
+ * would print the haystack when it fails, which for these tests is the very
+ * secret under test, straight into the log the failure gets pasted into.
+ */
+const carries = (text: string, key: string): boolean => text.includes(key)
+
+/** The port we are really listening on, which is the one thing a forged Host cannot change. */
+const port = (): number => Number(new URL(url).port)
+
+/**
+ * A request made the way an attacker makes one: with whatever it pleases in
+ * the Host header. `fetch` refuses to send a forged Host — the fetch spec
+ * forbids it — and Host is precisely the header a rebound name controls, so
+ * this has to go out over raw http.
+ */
+const raw = (sent: {
+  method: string
+  path: string
+  headers?: Record<string, string>
+  body?: string
+}): Promise<{ status: number; head: string; body: string }> =>
+  new Promise((done, fail) => {
+    const outgoing = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: port(),
+        method: sent.method,
+        path: sent.path,
+        headers: sent.headers ?? {},
+      },
+      (incoming) => {
+        let body = ''
+        incoming.setEncoding('utf8')
+        incoming.on('data', (chunk: string) => {
+          body += chunk
+        })
+        incoming.on('end', () =>
+          done({ status: incoming.statusCode ?? 0, head: incoming.rawHeaders.join('\n'), body }),
+        )
+      },
+    )
+    outgoing.on('error', fail)
+    if (sent.body !== undefined) outgoing.write(sent.body)
+    outgoing.end()
+  })
+
+/**
+ * A websocket handshake spelled out by hand, so the response can be read the
+ * way everything between here and the page reads it: as bytes. A ws client
+ * would hand back a tidy object; what is at stake is what the server actually
+ * wrote on the wire. Resolves with the response head, up to the blank line.
+ */
+const rawHandshake = (nodeId: string, offered: string[]): Promise<string> =>
+  new Promise((done, fail) => {
+    const socket = connect(port(), '127.0.0.1')
+    rawSockets.push(socket)
+
+    socket.on('error', fail)
+    socket.on('connect', () =>
+      socket.write(
+        `GET /session?node=${nodeId} HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${port()}\r\n` +
+          `Origin: ${url}\r\n` +
+          'Upgrade: websocket\r\n' +
+          'Connection: Upgrade\r\n' +
+          `Sec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n` +
+          'Sec-WebSocket-Version: 13\r\n' +
+          `Sec-WebSocket-Protocol: ${offered.join(', ')}\r\n` +
+          '\r\n',
+      ),
+    )
+
+    let seen = ''
+    socket.on('data', (chunk: Buffer) => {
+      seen += chunk.toString('latin1')
+      const blankLine = seen.indexOf('\r\n\r\n')
+      if (blankLine !== -1) done(seen.slice(0, blankLine))
+    })
+    socket.on('close', () => done(seen))
+  })
+
 beforeEach(async () => {
   sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-access-')))
 
@@ -131,6 +218,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const socket of opened.splice(0)) socket.terminate()
+  for (const socket of rawSockets.splice(0)) socket.destroy()
   await stop?.()
   process.env.PATH = originalPath
   rmSync(sandbox, { recursive: true, force: true })
@@ -224,6 +312,57 @@ describe('a page on another website', () => {
 
     expect(response.status).toBe(403)
     await expect(nodeIds()).resolves.toEqual(before)
+  })
+})
+
+/**
+ * DNS rebinding, which is how a foreign page stops looking foreign.
+ *
+ * The attacker serves a page from a name they own, then repoints that name at
+ * 127.0.0.1. The browser now believes evil.example *is* this server: it sends
+ * `Host: evil.example:<our port>`, calls the request same-origin, and hands
+ * the response body to the attacker's script. Every header in that request is
+ * the attacker's to write. The port we are really listening on is not — which
+ * is the whole reason "ourselves" is built from the listening port and never
+ * from Host.
+ */
+describe('a page whose dns has been rebound onto this server', () => {
+  const rebound = () => ({ host: `evil.example:${port()}`, origin: `http://evil.example:${port()}` })
+
+  it('cannot read this run’s key off the page by forging Host', async () => {
+    const key = await keyFromPage()
+    const { host, origin } = rebound()
+
+    const honest = await raw({ method: 'GET', path: '/' })
+    const attacker = await raw({ method: 'GET', path: '/', headers: { host, origin } })
+
+    // The page really does carry the key, so the assertion below has teeth.
+    expect(carries(honest.body, key)).toBe(true)
+
+    // And the rebound name gets none of it, in the body or anywhere else.
+    expect(carries(attacker.body, key)).toBe(false)
+    expect(carries(attacker.head, key)).toBe(false)
+  })
+
+  it('cannot fork a Node by forging Host, even holding this run’s key', async () => {
+    const before = await nodeIds()
+    const { host, origin } = rebound()
+
+    const response = await raw({
+      method: 'POST',
+      path: '/api/fork',
+      headers: {
+        host,
+        origin,
+        'content-type': 'application/json',
+        [KEY_HEADER]: await keyFromPage(),
+      },
+      body: JSON.stringify({ parentId: 'trunk' }),
+    })
+
+    expect(response.status).toBe(403)
+    await expect(nodeIds()).resolves.toEqual(before)
+    expect(git(repo, 'worktree', 'list')).not.toContain('.nodegraph')
   })
 })
 
@@ -322,6 +461,54 @@ describe('the page nodegraph itself serves', () => {
     // any link the user follows, and in the browser's own history.
     for (const found of html.matchAll(/(?:href|src|action)="([^"]*)"/g)) {
       expect(found[1]).not.toContain(key)
+    }
+  })
+})
+
+/**
+ * A browser cannot put a header on a handshake, so the key goes up as one of
+ * the subprotocols the page says it speaks — and a handshake replies by naming
+ * the one it picked. Name the key-bearing one and the key comes straight back
+ * down in a plaintext response header, on a request that predates any
+ * encryption of the frames: into proxy logs, devtools exports, har files,
+ * every hop between here and the page. So the reply is always the plain one.
+ */
+describe('the handshake that puts a viewer in front of an agent', () => {
+  it('never repeats this run’s key back in the 101 it answers with', async () => {
+    const key = await keyFromPage()
+
+    // Offered exactly the way the page offers it: the plain one, and the key.
+    const head = await rawHandshake('trunk', [SESSION_PROTOCOL, keyProtocol(key)])
+
+    // It really did upgrade, so this is a 101 and not a refusal in disguise.
+    expect(head.split('\r\n')[0]).toContain('101')
+
+    expect(carries(head, key)).toBe(false)
+  })
+})
+
+/**
+ * The key is minted per run and never written down, so the page carrying it is
+ * good for exactly one run. Let a browser or a proxy keep a copy and the key
+ * lands in a cache directory on disk, where it outlives the process that made
+ * it and where that process can never reach it to take it back. The user's own
+ * half of the bargain is the same header: a cached page comes back holding
+ * last run's key, which does not work, which reads as nodegraph being broken.
+ */
+describe('the page this run’s key is handed out in', () => {
+  it('is served so that nothing along the way may keep a copy of it', async () => {
+    const key = await keyFromPage()
+
+    // Both the root and a client-side route, because both are that same page
+    // with that same key in them.
+    for (const path of ['/', '/node/trunk']) {
+      const response = await fetch(`${url}${path}`)
+
+      // Only worth asserting on because this really is the page with the key.
+      expect(carries(await response.text(), key)).toBe(true)
+      // A missing header is the same failure as a permissive one, so read it
+      // as the empty string rather than letting `null` blow up the assertion.
+      expect(response.headers.get('cache-control') ?? '').toContain('no-store')
     }
   })
 })
