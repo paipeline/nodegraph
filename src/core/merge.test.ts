@@ -12,6 +12,7 @@ const node = (id: string, over: Partial<FlowNode> = {}): FlowNode => ({
     branch: id,
     workspacePath: `/repo/${id}`,
     environment: 'ready',
+    forkRefusal: null,
   },
   ...over,
 })
@@ -40,6 +41,7 @@ describe('mergeGraph', () => {
             branch: 'renamed',
             workspacePath: '/repo/trunk',
             environment: 'ready',
+            forkRefusal: null,
           },
         }),
       ]),

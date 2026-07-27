@@ -1,4 +1,4 @@
-import type { EnvironmentStatus } from './environment.js'
+import type { WorkspaceReport } from './environment.js'
 
 /**
  * Projects a snapshot of the world into the Nodes the graph should show.
@@ -31,7 +31,15 @@ export type NodeView = {
    * cloned behind it, has to say so — otherwise the user is looking at a
    * Workspace that is quietly half-built.
    */
-  environment: EnvironmentStatus
+  environment: WorkspaceReport['environment']
+  /**
+   * Why a Fork from this Node would be refused, or null when it would not.
+   * Carried on the Node rather than discovered on pressing the button: a
+   * refusal the user cannot see until they try is indistinguishable from a
+   * button that does not work. ADR-0002 already says as much about Forking a
+   * Node whose agent is mid-thought.
+   */
+  forkRefusal: string | null
 }
 
 /** What only nodegraph knows about a Node: where it came from, and from when. */
@@ -49,15 +57,15 @@ export const TRUNK_ID = 'trunk'
  * exist. A Fork we remember but git no longer has is not drawn — the graph is
  * allowed to forget, never to lie.
  *
- * `environments` is what each Workspace's environment is doing, keyed by path,
- * as an adapter read it off disk. A Workspace nobody reported on has nothing
- * still landing: the Trunk is nobody's Fork, and a Node whose environment
+ * `reports` is what an adapter read off each Workspace on disk, keyed by path.
+ * A Workspace nobody reported on has nothing still landing and nothing standing
+ * in the way of a Fork: the Trunk is nobody's Fork, and a Node whose environment
  * settled long ago leaves no trace of ever having been busy.
  */
 export const reconcile = (
   world: WorldSnapshot,
   forks: RecordedFork[],
-  environments: Record<string, EnvironmentStatus> = {},
+  reports: Record<string, WorkspaceReport> = {},
 ): NodeView[] => {
   const primary = world.worktrees.find((worktree) => worktree.isPrimary)
   if (!primary) return []
@@ -70,8 +78,10 @@ export const reconcile = (
       branch: primary.branch,
       parentId: null,
       // Trunk is the one Node nodegraph never built, so there is nothing it
-      // could be in the middle of building.
+      // could be in the middle of building. It is still the Node most Forks
+      // start from, so what would stop one still has to be said here.
       environment: 'ready',
+      forkRefusal: reports[primary.path]?.forkRefusal ?? null,
     },
     ...forks.flatMap((fork) => {
       const worktree = world.worktrees.find((candidate) => candidate.path === fork.workspacePath)
@@ -84,7 +94,8 @@ export const reconcile = (
           workspacePath: worktree.path,
           branch: worktree.branch,
           parentId: fork.parentId,
-          environment: environments[worktree.path] ?? 'ready',
+          environment: reports[worktree.path]?.environment ?? 'ready',
+          forkRefusal: reports[worktree.path]?.forkRefusal ?? null,
         },
       ]
     }),

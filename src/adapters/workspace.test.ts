@@ -79,6 +79,18 @@ const forkInAnotherNodegraph = (workspacePath: string) => {
     }
   }
 
+  /** Waits until a process is not merely signalled but reaped. */
+  const whenReaped = async (pid: number) => {
+    for (;;) {
+      try {
+        process.kill(pid, 0)
+      } catch {
+        return
+      }
+      await new Promise((wake) => setTimeout(wake, 20))
+    }
+  }
+
   return {
     kill,
     /**
@@ -93,14 +105,18 @@ const forkInAnotherNodegraph = (workspacePath: string) => {
         await new Promise((exited) => other.on('exit', exited))
       }
 
-      for (;;) {
-        try {
-          process.kill(worker, 0)
-        } catch {
-          return
-        }
-        await new Promise((wake) => setTimeout(wake, 20))
-      }
+      await whenReaped(worker)
+    },
+    /**
+     * Kills the nodegraph and nothing else. The hook it started is a process of
+     * its own, so it goes on writing into the Workspace with nobody left to
+     * finish the job — which is what an ordinary `kill`, a crash or a supervisor
+     * restart does to a Fork whose `npm install` is still running.
+     */
+    killTheNodegraphOnly: async () => {
+      const worker = Number(readFileSync(pidFile, 'utf8'))
+      process.kill(worker, 'SIGKILL')
+      await whenReaped(worker)
     },
   }
 }
@@ -452,6 +468,44 @@ describe('provisioning a Workspace', () => {
       // Discard has to be believable: a Workspace that reappears seconds later,
       // half-built and owned by nobody, is the one thing that would stop anyone
       // daring to Discard again.
+      expect(existsSync(finished)).toBe(true)
+      expect(existsSync(workspacePath)).toBe(false)
+      expect(git(repo, 'branch', '--list', 'nodegraph/child')).toBe('')
+
+      await new Promise((wake) => setTimeout(wake, 500))
+      expect(existsSync(workspacePath)).toBe(false)
+    } finally {
+      other.kill()
+    }
+  })
+
+  it('takes a Workspace away whole when the nodegraph filling it died and its hook did not', async () => {
+    writeFileSync(join(repo, '.gitignore'), '.nodegraph/\n')
+    mkdirSync(join(repo, '.nodegraph'), { recursive: true })
+    const started = join(repo, '.nodegraph', 'hook-started')
+    const finished = join(repo, '.nodegraph', 'hook-finished')
+
+    writeFileSync(
+      join(repo, '.nodegraph.on-fork'),
+      `#!/bin/sh\ntouch "${started}"\nsleep 2\nmkdir -p "$NODEGRAPH_WORKSPACE/node_modules"\necho late > "$NODEGRAPH_WORKSPACE/node_modules/index.js"\ntouch "${finished}"\n`,
+    )
+    chmodSync(join(repo, '.nodegraph.on-fork'), 0o755)
+    const workspacePath = join(repo, '.nodegraph', 'workspaces', 'child')
+
+    const other = forkInAnotherNodegraph(workspacePath)
+
+    try {
+      await waitFor(started)
+
+      // The user quits nodegraph — or it crashes — while a Fork's environment is
+      // still being built. The hook outlives it and keeps writing.
+      await other.killTheNodegraphOnly()
+
+      // Nobody is coming back to finish this environment, so the Node is right
+      // to say it failed and the user is right to Discard it. Doing so must
+      // still take the Workspace away for good.
+      await removeWorkspace({ from: repo, workspacePath, branch: 'nodegraph/child' })
+
       expect(existsSync(finished)).toBe(true)
       expect(existsSync(workspacePath)).toBe(false)
       expect(git(repo, 'branch', '--list', 'nodegraph/child')).toBe('')

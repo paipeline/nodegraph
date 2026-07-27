@@ -9,6 +9,7 @@ const trunk: NodeView = {
   branch: 'main',
   parentId: null,
   environment: 'ready',
+  forkRefusal: null,
 }
 
 describe('toFlowGraph', () => {
@@ -27,6 +28,7 @@ describe('toFlowGraph', () => {
           branch: 'main',
           workspacePath: '/repo',
           environment: 'ready',
+          forkRefusal: null,
         },
       },
     ])
@@ -42,10 +44,17 @@ describe('toFlowGraph', () => {
         branch: 'nodegraph/abc',
         parentId: 'trunk',
         environment: 'preparing',
+        forkRefusal: null,
       },
     ])
 
     expect(graph.nodes[1]?.data.environment).toBe('preparing')
+  })
+
+  it('hands the browser the reason a Node cannot be forked from', () => {
+    const graph = toFlowGraph([{ ...trunk, forkRefusal: 'chmod +x /repo/.nodegraph.on-fork' }])
+
+    expect(graph.nodes[0]?.data.forkRefusal).toBe('chmod +x /repo/.nodegraph.on-fork')
   })
 
   it('labels a detached Trunk without pretending it has a branch', () => {

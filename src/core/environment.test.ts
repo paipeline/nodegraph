@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   carriedAdditions,
   gitDirOf,
+  hookRefusal,
   holdsAWorktree,
   readHookVerdict,
   splitEnvironment,
@@ -116,6 +117,21 @@ describe('reading the project’s on-fork hook', () => {
   })
 })
 
+describe('what the user is told when a Fork cannot start', () => {
+  it('says what is wrong and the command that fixes it', () => {
+    const refusal = hookRefusal('not-executable', '/repo/.nodegraph.on-fork')
+
+    // Not a diagnosis to be looked up: the sentence contains the fix.
+    expect(refusal).toContain('.nodegraph.on-fork')
+    expect(refusal).toContain('chmod +x /repo/.nodegraph.on-fork')
+  })
+
+  it('refuses nothing when the hook is runnable, or absent altogether', () => {
+    expect(hookRefusal('run', '/repo/.nodegraph.on-fork')).toBeNull()
+    expect(hookRefusal('no-hook', '/repo/.nodegraph.on-fork')).toBeNull()
+  })
+})
+
 describe('what a Workspace’s environment marker means', () => {
   it('reads a Workspace with no marker as settled', () => {
     expect(statusFromMarker(undefined, alive)).toBe('ready')
@@ -131,6 +147,21 @@ describe('what a Workspace’s environment marker means', () => {
 
   it('keeps promising an environment whose owner it cannot name', () => {
     expect(statusFromMarker({ status: 'preparing' }, dead)).toBe('preparing')
+  })
+
+  it('keeps promising while the process doing the writing is alive, owner or not', () => {
+    // A hook is a process of its own: killing nodegraph leaves the `npm install`
+    // it started writing into the Workspace. Reading that as "nothing is
+    // happening here" is how a Discard is followed by the Workspace coming back.
+    const onlyTheWriter = (pid: number) => pid === 99
+
+    expect(statusFromMarker({ status: 'preparing', owner: 42, writer: 99 }, onlyTheWriter)).toBe(
+      'preparing',
+    )
+  })
+
+  it('stops promising once neither the nodegraph nor its writer is left', () => {
+    expect(statusFromMarker({ status: 'preparing', owner: 42, writer: 99 }, dead)).toBe('failed')
   })
 
   it('reports a failure whoever wrote it', () => {

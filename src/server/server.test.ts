@@ -60,6 +60,7 @@ describe('the local server', () => {
           branch: 'main',
           parentId: null,
           environment: 'ready',
+          forkRefusal: null,
         },
       ],
     })
@@ -96,11 +97,34 @@ describe('the local server', () => {
             branch: 'main',
             workspacePath: repo,
             environment: 'ready',
+            forkRefusal: null,
           },
         },
       ],
       edges: [],
     })
+  })
+
+  it('tells the page why a Fork cannot start, before anyone presses the button', async () => {
+    // The `chmod +x` everybody forgets the first time. A Fork attempted now is
+    // refused, and a refusal the user cannot read is a broken button.
+    writeFileSync(join(repo, '.nodegraph.on-fork'), '#!/bin/sh\necho built > built-by-hook\n')
+    chmodSync(join(repo, '.nodegraph.on-fork'), 0o644)
+
+    const graph = (await (await fetch(`${url}/api/graph`)).json()) as {
+      nodes: { id: string; data: { forkRefusal: string | null } }[]
+    }
+
+    const refusal = graph.nodes.find((each) => each.id === 'trunk')?.data.forkRefusal
+    expect(refusal).toContain('.nodegraph.on-fork')
+    expect(refusal).toContain(`chmod +x ${join(repo, '.nodegraph.on-fork')}`)
+
+    // And it goes away by doing what it says, without restarting anything.
+    chmodSync(join(repo, '.nodegraph.on-fork'), 0o755)
+    const fixed = (await (await fetch(`${url}/api/graph`)).json()) as {
+      nodes: { id: string; data: { forkRefusal: string | null } }[]
+    }
+    expect(fixed.nodes.find((each) => each.id === 'trunk')?.data.forkRefusal).toBeNull()
   })
 
   it('forks a Node, and the graph shows the child and the edge to it straight away', async () => {

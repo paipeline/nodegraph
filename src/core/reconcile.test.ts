@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'vitest'
+import type { WorkspaceReport } from './environment.js'
 import { reconcile, type WorldSnapshot } from './reconcile.js'
 
 const snapshot = (worktrees: WorldSnapshot['worktrees']): WorldSnapshot => ({
   repoPath: '/repo',
   worktrees,
+})
+
+const report = (report: Partial<WorkspaceReport>): WorkspaceReport => ({
+  environment: 'ready',
+  forkRefusal: null,
+  ...report,
 })
 
 describe('reconcile', () => {
@@ -21,6 +28,7 @@ describe('reconcile', () => {
         branch: 'main',
         parentId: null,
         environment: 'ready',
+        forkRefusal: null,
       },
     ])
   })
@@ -85,6 +93,7 @@ describe('reconcile', () => {
         branch: 'main',
         parentId: null,
         environment: 'ready',
+        forkRefusal: null,
       },
       {
         id: 'abc',
@@ -93,6 +102,7 @@ describe('reconcile', () => {
         branch: 'nodegraph/abc',
         parentId: 'trunk',
         environment: 'ready',
+        forkRefusal: null,
       },
     ])
   })
@@ -111,7 +121,7 @@ describe('reconcile', () => {
           forkPointSha: '0123456789abcdef0123456789abcdef01234567',
         },
       ],
-      { '/repo/.nodegraph/workspaces/abc': 'preparing' },
+      { '/repo/.nodegraph/workspaces/abc': report({ environment: 'preparing' }) },
     )
 
     expect(nodes.map((node) => [node.id, node.environment])).toEqual([
@@ -134,7 +144,7 @@ describe('reconcile', () => {
           forkPointSha: '0123456789abcdef0123456789abcdef01234567',
         },
       ],
-      { '/repo/.nodegraph/workspaces/abc': 'failed' },
+      { '/repo/.nodegraph/workspaces/abc': report({ environment: 'failed' }) },
     )
 
     expect(nodes[1]?.environment).toBe('failed')
@@ -142,10 +152,20 @@ describe('reconcile', () => {
 
   it('never says the Trunk is preparing — nodegraph never built it', () => {
     const nodes = reconcile(snapshot([{ path: '/repo', branch: 'main', isPrimary: true }]), [], {
-      '/repo': 'preparing',
+      '/repo': report({ environment: 'preparing' }),
     })
 
     expect(nodes[0]?.environment).toBe('ready')
+  })
+
+  it('carries the reason a Node cannot be forked from, Trunk included', () => {
+    // A Trunk whose project wrote a hook nobody can run is the first Node the
+    // user will try to Fork from, so it is the first that has to say why not.
+    const nodes = reconcile(snapshot([{ path: '/repo', branch: 'main', isPrimary: true }]), [], {
+      '/repo': report({ forkRefusal: 'chmod +x /repo/.nodegraph.on-fork' }),
+    })
+
+    expect(nodes[0]?.forkRefusal).toBe('chmod +x /repo/.nodegraph.on-fork')
   })
 
   it('drops a recorded Fork whose Workspace is no longer in the world', () => {

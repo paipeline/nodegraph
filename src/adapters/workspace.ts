@@ -1,16 +1,20 @@
 import { execFile, spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import {
   carriedAdditions,
   gitDirOf,
+  hookRefusal,
   NO_ENVIRONMENT,
+  ON_FORK,
   readHookVerdict,
   splitEnvironment,
   statusFromMarker,
   type Environment,
   type EnvironmentStatus,
+  type WorkspaceReport,
 } from '../core/environment.js'
 import { homeOf } from './store.js'
 
@@ -84,6 +88,105 @@ const readIgnoredEntries = async (from: string): Promise<Environment> =>
   })
 
 /**
+ * A Workspace's environment status has to survive the process that started the
+ * work: the graph is redrawn by whoever is running now, which may be a second
+ * nodegraph, or this one after a restart. So it is written down where the
+ * Workspace itself keeps its state — git's own per-worktree directory, which
+ * nothing walks, `git status` never reports, and `git worktree remove` takes
+ * away with the Workspace. A marker inside the Workspace would instead show up
+ * as a change the user did not make, and be carried into the next Fork.
+ */
+const MARKER = 'nodegraph-environment.json'
+
+const markerPath = async (workspacePath: string): Promise<string> => {
+  // Every linked worktree keeps a `.git` file pointing at its own admin
+  // directory, and reading it beats spawning a git for every Node on every
+  // poll. Anything else — a real `.git` directory, a file we do not recognise
+  // — and git is asked properly.
+  const link = await readFile(join(workspacePath, '.git'), 'utf8').catch(() => undefined)
+  const gitDir = link === undefined ? undefined : gitDirOf(workspacePath, link)
+  const asked = gitDir ?? (await git(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim()
+
+  return join(asked, MARKER)
+}
+
+/**
+ * Says that this Workspace is still being filled, and by whom.
+ *
+ * `owner` is the nodegraph that promised the environment and will write down
+ * how it ended; `writer` is the child process actually putting bytes in the
+ * Workspace right now, if there is one. Both are named because they do not die
+ * together — see `statusFromMarker`.
+ *
+ * Written synchronously on purpose: it is called the instant a child process
+ * exists, and an `await` between the two would be a window in which something
+ * is writing into a Workspace that says nothing is.
+ */
+const claimWorkspace = (marker: string, writer?: number): void => {
+  try {
+    writeFileSync(marker, `${JSON.stringify({ status: 'preparing', owner: process.pid, writer })}\n`)
+  } catch {
+    // The Workspace — or the git directory its marker lives in — has been taken
+    // away already. There is nothing left to claim, and nobody left to tell.
+  }
+}
+
+const settleEnvironment = async (marker: string, status: EnvironmentStatus): Promise<void> => {
+  // No marker is the resting state, so `ready` is written by taking it away.
+  if (status === 'ready') {
+    await rm(marker, { force: true })
+    return
+  }
+
+  await writeFile(marker, `${JSON.stringify({ status, owner: process.pid })}\n`)
+}
+
+const STDERR_KEPT = 4096
+
+/**
+ * Runs a child process that writes into a Workspace, with the marker naming it
+ * for as long as it runs.
+ *
+ * A hook — or the `cp` cloning `node_modules` — is a process of its own, and
+ * killing nodegraph does not kill it. Naming only the nodegraph would answer
+ * the wrong question: what a Discard needs to know is whether anything is still
+ * writing here, not whether whoever asked for it is still around to hear.
+ */
+const spawnIntoWorkspace = (
+  marker: string,
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<void> =>
+  new Promise((settle, fail) => {
+    const child = spawn(command, args, { ...options, stdio: ['ignore', 'ignore', 'pipe'] })
+
+    claimWorkspace(marker, child.pid)
+
+    let stderr = ''
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(0, STDERR_KEPT)
+    })
+
+    // The Workspace goes back to being claimed by this nodegraph alone before
+    // anyone is told the child is done, so no reader ever sees it named after a
+    // process that has already gone.
+    const done = (finish: () => void) => {
+      claimWorkspace(marker)
+      finish()
+    }
+
+    child.on('error', (error) => done(() => fail(error)))
+    child.on('close', (code, signal) =>
+      done(() =>
+        code === 0
+          ? settle()
+          : fail(new Error(`${command} exited ${signal ?? code}: ${stderr.trim()}`)),
+      ),
+    )
+  })
+
+/**
  * An environment directory, copied the cheapest way the filesystem allows.
  *
  * On APFS and on btrfs/xfs this is copy-on-write: a second `node_modules` costs
@@ -92,16 +195,21 @@ const readIgnoredEntries = async (from: string): Promise<Environment> =>
  * but the Node ends up with exactly the same directory either way, which is the
  * only thing anyone outside here is allowed to notice.
  */
-const cloneDirectory = async (source: string, destination: string): Promise<void> => {
+const cloneDirectory = async (
+  source: string,
+  destination: string,
+  marker: string,
+): Promise<void> => {
   const copyOnWrite = process.platform === 'darwin' ? ['-Rc'] : ['-a', '--reflink=auto']
 
   try {
-    await run('cp', [...copyOnWrite, source, destination])
+    await spawnIntoWorkspace(marker, 'cp', [...copyOnWrite, source, destination])
     return
   } catch {
     // No clonefile on this filesystem, or no `cp` worth the name. Fall back —
     // but first clear whatever half a directory the attempt left, or the copy
-    // would land *inside* it.
+    // would land *inside* it. This copy runs in this process, so it cannot
+    // outlive it and needs no naming in the marker.
     await rm(destination, { recursive: true, force: true })
   }
 
@@ -119,27 +227,36 @@ const cloneDirectory = async (source: string, destination: string): Promise<void
  * only if it can be run at all. A file there that cannot is refused rather than
  * handed to a process or quietly stepped around: see `readHookVerdict`.
  */
-const ON_FORK = '.nodegraph.on-fork'
+const readHook = async (workspacePath: string) => {
+  const hook = join(workspacePath, ON_FORK)
+  const found = await stat(hook).catch(() => undefined)
+
+  return {
+    hook,
+    verdict: readHookVerdict(
+      found === undefined ? undefined : { isFile: found.isFile(), mode: found.mode },
+    ),
+  }
+}
 
 const onForkHook = async (from: string): Promise<string | undefined> => {
-  const hook = join(from, ON_FORK)
-  const found = await stat(hook).catch(() => undefined)
-  const verdict = readHookVerdict(
-    found === undefined ? undefined : { isFile: found.isFile(), mode: found.mode },
-  )
+  const { hook, verdict } = await readHook(from)
 
-  if (verdict === 'not-executable') {
-    throw new Error(
-      `${ON_FORK} is not executable, so this Fork would arrive with no environment at all. ` +
-        `Run: chmod +x ${hook}`,
-    )
-  }
+  // The same sentence the Node has been showing on its card all along, so the
+  // refusal the user reads and the refusal that stops the Fork cannot drift.
+  const refusal = hookRefusal(verdict, hook)
+  if (refusal !== null) throw new Error(refusal)
 
   return verdict === 'run' ? hook : undefined
 }
 
-const runHook = async (hook: string, from: string, workspacePath: string): Promise<void> => {
-  await run(hook, [], {
+const runHook = (
+  hook: string,
+  from: string,
+  workspacePath: string,
+  marker: string,
+): Promise<void> =>
+  spawnIntoWorkspace(marker, hook, [], {
     cwd: workspacePath,
     env: {
       ...process.env,
@@ -147,7 +264,6 @@ const runHook = async (hook: string, from: string, workspacePath: string): Promi
       NODEGRAPH_PARENT_WORKSPACE: from,
     },
   })
-}
 
 const copyInto = async (from: string, workspacePath: string, relativePath: string) => {
   const destination = join(workspacePath, relativePath)
@@ -177,46 +293,6 @@ const applyPatch = (cwd: string, patch: string): Promise<void> =>
  */
 const preparing = new Map<string, Promise<EnvironmentStatus>>()
 
-/**
- * A Workspace's environment status has to survive the process that started the
- * work: the graph is redrawn by whoever is running now, which may be a second
- * nodegraph, or this one after a restart. So it is written down where the
- * Workspace itself keeps its state — git's own per-worktree directory, which
- * nothing walks, `git status` never reports, and `git worktree remove` takes
- * away with the Workspace. A marker inside the Workspace would instead show up
- * as a change the user did not make, and be carried into the next Fork.
- */
-const MARKER = 'nodegraph-environment.json'
-
-const markerPath = async (workspacePath: string): Promise<string> => {
-  // Every linked worktree keeps a `.git` file pointing at its own admin
-  // directory, and reading it beats spawning a git for every Node on every
-  // poll. Anything else — a real `.git` directory, a file we do not recognise
-  // — and git is asked properly.
-  const link = await readFile(join(workspacePath, '.git'), 'utf8').catch(() => undefined)
-  const gitDir = link === undefined ? undefined : gitDirOf(workspacePath, link)
-  const asked = gitDir ?? (await git(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim()
-
-  return join(asked, MARKER)
-}
-
-const recordEnvironment = async (
-  workspacePath: string,
-  status: EnvironmentStatus,
-): Promise<void> => {
-  const marker = await markerPath(workspacePath)
-
-  // No marker is the resting state, so `ready` is written by taking it away.
-  if (status === 'ready') {
-    await rm(marker, { force: true })
-    return
-  }
-
-  // Whose promise this is. Only the nodegraph that started the work can finish
-  // it, so if that process is gone the promise died with it.
-  await writeFile(marker, `${JSON.stringify({ status, owner: process.pid })}\n`)
-}
-
 const stillRunning = (pid: number): boolean => {
   try {
     process.kill(pid, 0)
@@ -241,18 +317,35 @@ export const readEnvironmentStatus = async (workspacePath: string): Promise<Envi
   return statusFromMarker(marker, stillRunning)
 }
 
-/** The same answer for a whole graph's worth of Workspaces, keyed by path. */
-export const readEnvironments = async (
+/**
+ * Everything a Node has to say about its own Workspace, keyed by path.
+ *
+ * The refusal is read on every poll rather than remembered, because the fix for
+ * it is a `chmod` in another terminal: a Node that went on refusing until
+ * nodegraph was restarted would be worse than one that never explained itself.
+ */
+export const readWorkspaceReports = async (
   workspacePaths: string[],
-): Promise<Record<string, EnvironmentStatus>> =>
+): Promise<Record<string, WorkspaceReport>> =>
   Object.fromEntries(
     await Promise.all(
-      workspacePaths.map(async (path) => [path, await readEnvironmentStatus(path)] as const),
+      workspacePaths.map(async (path) => {
+        const { hook, verdict } = await readHook(path)
+
+        return [
+          path,
+          {
+            environment: await readEnvironmentStatus(path),
+            forkRefusal: hookRefusal(verdict, hook),
+          },
+        ] as const
+      }),
     ),
   )
 
 const prepareInBackground = (
   workspacePath: string,
+  marker: string,
   work: () => Promise<void>,
 ): Promise<EnvironmentStatus> => {
   const settled = work()
@@ -261,7 +354,7 @@ const prepareInBackground = (
       (): EnvironmentStatus => 'failed',
     )
     .then(async (status) => {
-      await recordEnvironment(workspacePath, status).catch(() => undefined)
+      await settleEnvironment(marker, status).catch(() => undefined)
       return status
     })
 
@@ -277,11 +370,12 @@ const pause = (ms: number): Promise<void> => new Promise((wake) => setTimeout(wa
  * Waits until nothing is still filling a Workspace's environment.
  *
  * The work is usually this process's own, and then the promise is right here.
- * When it is not — a second nodegraph, or this one before a restart — the only
- * handle anybody has on it is the marker that process left, so this waits for
- * that to stop saying `preparing`. Reading it once and carrying on regardless
- * is exactly how a Workspace gets torn down under a live writer and reappears a
- * second later. The wait always ends: a preparer that dies is read as `failed`.
+ * When it is not — a second nodegraph, or this one before a restart, or a hook
+ * left running by a nodegraph that has since died — the only handle anybody has
+ * on it is the marker, so this waits for that to stop saying `preparing`.
+ * Reading it once and carrying on regardless is exactly how a Workspace gets
+ * torn down under a live writer and reappears a second later. The wait always
+ * ends: a marker whose owner and whose writer are both gone reads as `failed`.
  */
 export const whenEnvironmentSettles = async (workspacePath: string): Promise<EnvironmentStatus> => {
   const ours = preparing.get(workspacePath)
@@ -336,18 +430,19 @@ export const provisionWorkspace = async ({
     // already has — so say the environment is coming, hand the Workspace over,
     // and let the rest land behind the agent's back.
     if (hook !== undefined || ignored.directories.length > 0) {
-      await recordEnvironment(workspacePath, 'preparing')
+      const marker = await markerPath(workspacePath)
+      claimWorkspace(marker)
 
-      prepareInBackground(workspacePath, async () => {
+      prepareInBackground(workspacePath, marker, async () => {
         if (hook !== undefined) {
-          await runHook(hook, from, workspacePath)
+          await runHook(hook, from, workspacePath, marker)
           return
         }
 
         for (const relativePath of ignored.directories) {
           const destination = join(workspacePath, relativePath)
           await mkdir(dirname(destination), { recursive: true })
-          await cloneDirectory(join(from, relativePath), destination)
+          await cloneDirectory(join(from, relativePath), destination, marker)
         }
       })
     }
@@ -374,7 +469,8 @@ export const removeWorkspace = async ({
 }): Promise<void> => {
   // Nothing may still be writing into a Workspace that is being taken away, or
   // it reappears a second later, half a Workspace, owned by nobody — whether
-  // the writer is this nodegraph or another one.
+  // the writer is this nodegraph, another one, or a hook whose nodegraph is
+  // already dead.
   await whenEnvironmentSettles(workspacePath)
   preparing.delete(workspacePath)
 
