@@ -10,6 +10,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { createContext, useCallback, useContext, useEffect } from 'react'
+import { describeDiff, type DiffSummary } from '../../src/core/diff.js'
 import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
 import { runKey } from './key.js'
@@ -20,6 +21,8 @@ export type NodeData = {
   kind: 'trunk' | 'fork'
   branch: string | null
   workspacePath: string
+  /** What this Node changed since its fork point. The Trunk has no fork point. */
+  diff?: DiffSummary
 }
 
 type GraphNode = Node<NodeData>
@@ -39,6 +42,7 @@ const NodeCard = ({ id, data }: NodeProps<GraphNode>) => {
       <span className="card__path" title={data.workspacePath}>
         {data.workspacePath}
       </span>
+      {data.diff !== undefined && <span className="card__diff">{describeDiff(data.diff)}</span>}
       <button className="card__fork nodrag" type="button" onClick={() => onFork(id)}>
         Fork
       </button>
@@ -53,12 +57,20 @@ export const App = () => {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
   const load = useCallback(async () => {
-    const response = await fetch('/api/graph')
+    const [response, measured] = await Promise.all([fetch('/api/graph'), fetch('/api/diffs')])
     if (!response.ok) throw new Error(`Server answered ${response.status}`)
+    if (!measured.ok) throw new Error(`Server answered ${measured.status}`)
     const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
+    const { diffs } = (await measured.json()) as { diffs: (DiffSummary & { nodeId: string })[] }
+    const byNode = new Map(diffs.map(({ nodeId, ...summary }) => [nodeId, summary]))
 
     // The server says what exists; the browser keeps where it sits.
-    setNodes((current) => mergeGraph(current, incoming).nodes)
+    setNodes((current) =>
+      mergeGraph(current, incoming).nodes.map((node) => ({
+        ...node,
+        data: { ...node.data, diff: byNode.get(node.id) },
+      })),
+    )
     setEdges(incoming.edges)
   }, [setNodes, setEdges])
 

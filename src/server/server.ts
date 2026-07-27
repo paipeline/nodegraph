@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { extname, join, resolve, sep } from 'node:path'
+import { readDiffs } from '../adapters/diff.js'
 import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
 import { readForks } from '../adapters/store.js'
@@ -167,6 +168,13 @@ const handle = async (
   // tested. The browser only draws what it is given.
   if (pathname === '/api/graph') {
     json(response, 200, toFlowGraph(await currentNodes(options.repoPath)))
+    return
+  }
+
+  // How far each Node has come, measured against the fork point recorded when
+  // it was forked. A read: it changes nothing and takes no key.
+  if (pathname === '/api/diffs') {
+    json(response, 200, { diffs: await readDiffs(options.repoPath) })
     return
   }
 
