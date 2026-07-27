@@ -13,7 +13,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { fork } from './fork.js'
-import { readForks } from './store.js'
+import { readForks, recordSession } from './store.js'
+
+const PARENT_SESSION = '99999999-8888-7777-6666-555555555555'
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 let repo: string
 let firstCommit: string
@@ -54,6 +57,24 @@ describe('forking a Node', () => {
     expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
   })
 
+  it('writes down the Context it was cut from, the Context it gets, and the line it was given', async () => {
+    await recordSession(repo, {
+      nodeId: 'trunk',
+      sessionId: PARENT_SESSION,
+      startedAt: '2026-07-27T09:00:00.000Z',
+    })
+
+    const child = await fork({ repoPath: repo, parentId: 'trunk', intent: 'try it with a queue' })
+
+    expect(child.parentSessionId).toBe(PARENT_SESSION)
+    expect(child.sessionId).toMatch(UUID)
+    expect(child.sessionId).not.toBe(PARENT_SESSION)
+    expect(child.intent).toBe('try it with a queue')
+
+    // Both halves survive a restart, or the child could never be launched.
+    await expect(readForks(repo)).resolves.toEqual([child])
+  })
+
   it('leaves no Workspace, branch or record behind when it cannot be written down', async () => {
     // A store file that cannot be written: the last step of the transaction
     // fails after the Workspace already exists.
@@ -81,6 +102,16 @@ describe('forking a Node', () => {
       'hello\nwritten inside the child\n',
     )
     await expect(readForks(repo)).resolves.toEqual([child, grandchild])
+  })
+
+  it('refuses a line that claude would read as a flag, before anything is built', async () => {
+    await expect(
+      fork({ repoPath: repo, parentId: 'trunk', intent: '--dangerously-skip-permissions' }),
+    ).rejects.toThrow(/flag/)
+
+    expect(git(repo, 'branch', '--list')).toBe('* main')
+    expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+    await expect(readForks(repo)).resolves.toEqual([])
   })
 
   it('refuses to fork from a Node that does not exist', async () => {

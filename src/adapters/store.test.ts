@@ -3,7 +3,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readForks, recordFork, type StoredFork } from './store.js'
+import { readForks, readSessions, recordFork, recordSession, type StoredFork } from './store.js'
 
 let repo: string
 
@@ -40,6 +40,26 @@ describe('the store of what only nodegraph knows', () => {
 
     await recordFork(repo, fork)
 
+    await expect(readForks(repo)).resolves.toEqual([fork])
+  })
+
+  it('remembers which Context a Node’s agent is living in, without disturbing the Forks', async () => {
+    const fork = aFork()
+    await recordFork(repo, fork)
+
+    await recordSession(repo, {
+      nodeId: 'trunk',
+      sessionId: '11111111-2222-3333-4444-555555555555',
+      startedAt: '2026-07-27T09:01:00.000Z',
+    })
+
+    await expect(readSessions(repo)).resolves.toEqual([
+      {
+        nodeId: 'trunk',
+        sessionId: '11111111-2222-3333-4444-555555555555',
+        startedAt: '2026-07-27T09:01:00.000Z',
+      },
+    ])
     await expect(readForks(repo)).resolves.toEqual([fork])
   })
 

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'ws'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { SESSION_PROTOCOL, toKeyProtocol } from '../core/guard.js'
+import { KEY_HEADER, SESSION_PROTOCOL, toKeyProtocol } from '../core/guard.js'
 import { startServer } from './server.js'
 
 /**
@@ -19,6 +19,12 @@ printf 'CWD[%s]\\n' "$(pwd -P)"
 while IFS= read -r line; do
   if [ "$line" = "quit" ]; then exit 7; fi
   if [ "$line" = "size" ]; then printf 'SIZE[%s]\\n' "$(stty size)"; continue; fi
+  if [ "$line" = "work" ]; then
+    i=0
+    while [ $i -lt 30 ]; do printf '.'; sleep 0.05; i=$((i+1)); done
+    printf 'DONE\\n'
+    continue
+  fi
   printf 'HEARD[%s]\\n' "$line"
 done
 `
@@ -64,6 +70,18 @@ const view = (nodeId: string) => {
     close: () => socket.close(),
   }
 }
+
+/** Forking changes the world, so it takes the key — as it does from the page. */
+const forkFrom = (parentId: string, intent?: string) =>
+  fetch(`${url}/api/fork`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', [KEY_HEADER]: key },
+    body: JSON.stringify({ parentId, intent }),
+  })
+
+const graph = async (): Promise<{
+  nodes: { id: string; data: { title?: string | null; forkRefusal?: string | null } }[]
+}> => (await fetch(`${url}/api/graph`)).json() as never
 
 beforeEach(async () => {
   sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'nodegraph-ws-')))
@@ -175,5 +193,66 @@ describe('the terminal behind a Node', () => {
 
     await settle(() => expect(viewer.frames[0]).toMatchObject({ type: 'error' }))
     await settle(() => expect(viewer.socket.readyState).toBe(WebSocket.CLOSED))
+  })
+})
+
+describe('the line written when a Node is Forked', () => {
+  it('becomes that Node’s title on the graph', async () => {
+    const forked = await forkFrom('trunk', '  try it with a   queue instead ')
+    expect(forked.status).toBe(201)
+    const { node } = (await forked.json()) as { node: { id: string } }
+
+    const drawn = await graph()
+
+    expect(drawn.nodes.find((candidate) => candidate.id === node.id)?.data.title).toBe(
+      'try it with a queue instead',
+    )
+    expect(drawn.nodes.find((candidate) => candidate.id === 'trunk')?.data.title).toBeNull()
+  })
+
+  it('is refused when claude would read it as a flag rather than as words', async () => {
+    const refused = await forkFrom('trunk', '--dangerously-skip-permissions')
+
+    expect(refused.status).toBe(400)
+    expect((await refused.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining('flag'),
+    })
+    expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+  })
+})
+
+describe('Forking a Node whose agent is at work', () => {
+  it('holds the Fork back with a reason, and lets it through once the agent stops', async () => {
+    const viewer = view('trunk')
+    await settle(() => expect(viewer.screen()).toContain('CWD['))
+
+    viewer.send({ type: 'input', data: 'work\r' })
+    // The fake claude paints while it works, the way the real one does.
+    await settle(() => expect(viewer.screen()).toContain('....'))
+
+    const refused = await forkFrom('trunk')
+    expect(refused.status).toBe(409)
+    expect((await refused.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining('still working'),
+    })
+
+    // Refused means nothing happened at all — no half-built Workspace.
+    expect(git(repo, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1)
+
+    // The page is told the same thing, so the entry can be disabled with the
+    // reason on it rather than failing under the user's hand.
+    const busy = await graph()
+    expect(busy.nodes[0]?.data.forkRefusal).toContain('still working')
+
+    // And once the agent stops for the user, the very same Fork goes through.
+    const allowed = await vi.waitFor(
+      async () => {
+        const response = await forkFrom('trunk')
+        expect(response.status).toBe(201)
+        return response
+      },
+      { timeout: 20_000, interval: 100 },
+    )
+    expect(allowed.status).toBe(201)
   })
 })

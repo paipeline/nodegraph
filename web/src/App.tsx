@@ -9,7 +9,7 @@ import {
   type NodeProps,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { createContext, useCallback, useContext, useEffect } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
 import { runKey } from './key.js'
@@ -20,6 +20,10 @@ export type NodeData = {
   kind: 'trunk' | 'fork'
   branch: string | null
   workspacePath: string
+  /** The line this Node was Forked to try. */
+  title?: string | null
+  /** Why this Node cannot be Forked right now, decided by the server. */
+  forkRefusal?: string | null
 }
 
 type GraphNode = Node<NodeData>
@@ -27,21 +31,70 @@ type GraphNode = Node<NodeData>
 const POLL_MS = 2000
 
 /** Node cards are rendered by ReactFlow, so the Fork action reaches them here. */
-const ForkContext = createContext<(parentId: string) => void>(() => {})
+const ForkContext = createContext<(parentId: string, intent: string) => Promise<string | null>>(
+  async () => null,
+)
 
 const NodeCard = ({ id, data }: NodeProps<GraphNode>) => {
   const onFork = useContext(ForkContext)
+  const [intent, setIntent] = useState<string | null>(null)
+  const [refused, setRefused] = useState<string | null>(null)
+
+  const refusal = data.forkRefusal ?? null
+
+  const submit = () => {
+    void (async () => {
+      const problem = await onFork(id, intent ?? '')
+      setRefused(problem)
+      if (problem === null) setIntent(null)
+    })()
+  }
 
   return (
     <div className={`card card--${data.kind}`}>
       <span className="card__kind">{data.kind}</span>
       <span className="card__label">{data.label}</span>
+      {data.title != null && <span className="card__title">{data.title}</span>}
       <span className="card__path" title={data.workspacePath}>
         {data.workspacePath}
       </span>
-      <button className="card__fork nodrag" type="button" onClick={() => onFork(id)}>
-        Fork
-      </button>
+
+      {intent === null ? (
+        <button
+          className="card__fork nodrag"
+          type="button"
+          // ADR-0002: a Fork copies this instant, so it is offered only when
+          // the agent has stopped — and the reason is on the button itself,
+          // because a control that is dead for no stated reason reads as broken.
+          disabled={refusal !== null}
+          title={refusal ?? 'Fork this Node'}
+          onClick={() => {
+            setRefused(null)
+            setIntent('')
+          }}
+        >
+          {refusal === null ? 'Fork' : 'Fork — agent is working'}
+        </button>
+      ) : (
+        <div className="card__compose nodrag">
+          <input
+            className="card__intent"
+            autoFocus
+            value={intent}
+            placeholder="What does this one go off to try?"
+            onChange={(event) => setIntent(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') submit()
+              if (event.key === 'Escape') setIntent(null)
+            }}
+          />
+          <button className="card__fork nodrag" type="button" onClick={submit}>
+            Fork
+          </button>
+        </div>
+      )}
+
+      {refused !== null && <span className="card__refused">{refused}</span>}
     </div>
   )
 }
@@ -62,17 +115,23 @@ export const App = () => {
     setEdges(incoming.edges)
   }, [setNodes, setEdges])
 
+  /** Returns the reason the Fork did not happen, or null when it did. */
   const onFork = useCallback(
-    (parentId: string) => {
-      void (async () => {
-        await fetch('/api/fork', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
-          body: JSON.stringify({ parentId }),
-        })
-        // Don't make the user wait out a poll to see what they just did.
-        await load()
-      })()
+    async (parentId: string, intent: string): Promise<string | null> => {
+      const response = await fetch('/api/fork', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [KEY_HEADER]: runKey() },
+        body: JSON.stringify({ parentId, intent }),
+      })
+
+      if (!response.ok) {
+        const { error } = (await response.json()) as { error?: string }
+        return error ?? `Server answered ${response.status}`
+      }
+
+      // Don't make the user wait out a poll to see what they just did.
+      await load()
+      return null
     },
     [load],
   )
