@@ -36,8 +36,14 @@ const opened: WebSocket[] = []
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
+/**
+ * How long to give a real pty to say something, not how long to wait for it —
+ * `waitFor` returns the moment the check holds. Four seconds was tight enough
+ * that a busy machine could lose the race to spawn a shell; `access.test.ts`
+ * has waited eight for the same reason since it was written.
+ */
 const settle = async (check: () => void): Promise<void> =>
-  vi.waitFor(check, { timeout: 4_000, interval: 20 })
+  vi.waitFor(check, { timeout: 8_000, interval: 20 })
 
 /** A viewer, the way a browser tab is a viewer — key and all. */
 const view = (nodeId: string) => {

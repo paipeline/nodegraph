@@ -344,6 +344,47 @@ describe('a store that says something nodegraph never wrote', () => {
   })
 
   /**
+   * The store's rule and git's list are two doors, and this is the one only git
+   * can shut. `.nodegraph/` is where nodegraph puts Workspaces, so a record
+   * naming a directory in there is a record it could have written — but a
+   * directory being *there* is not the same as git having a Workspace there.
+   * A repository shipped as a tarball rather than cloned brings whatever
+   * `.nodegraph/workspaces/<name>/` its author put in it, `.git` and all.
+   */
+  it('measures no Node in a directory git never listed, even where its own Workspaces live', async () => {
+    const child = await fork({ repoPath: repo, parentId: TRUNK_ID })
+    writeFileSync(join(child.workspacePath, 'a.txt'), 'one\ntwo\nthree\nfour\n')
+
+    // Exactly where nodegraph would have put a Workspace for this name, and
+    // spelled exactly as nodegraph spells one — but git has never heard of it.
+    const planted = join(repo, '.nodegraph', 'workspaces', 'deadbeef')
+    const head = anotherRepository(planted)
+    writeFileSync(join(planted, 'notes.txt'), 'a\nb\nc\nd\ne\n')
+    const ran = join(elsewhere, 'it-ran')
+    const payload = join(elsewhere, 'payload.sh')
+    writeFileSync(payload, `#!/bin/sh\nprintf 'ran\\n' >> "${ran}"\n`)
+    chmodSync(payload, 0o755)
+    git(planted, 'config', 'core.fsmonitor', payload)
+
+    rewriteStore([
+      ...storedForks(),
+      {
+        id: 'deadbeef',
+        parentId: TRUNK_ID,
+        branch: 'nodegraph/deadbeef',
+        workspacePath: planted,
+        forkPointSha: head,
+        createdAt: '2026-07-27T09:00:00.000Z',
+      },
+    ])
+
+    await expect(readDiffs(repo)).resolves.toEqual([
+      { nodeId: child.id, files: 1, insertions: 1, deletions: 0 },
+    ])
+    expect(existsSync(ran)).toBe(false)
+  })
+
+  /**
    * The same knob, in the one repository nodegraph is entitled to run git in.
    * The user chose to open this repository, so its config is theirs — but a
    * command run on a two-second poll, by a background process the user is not
