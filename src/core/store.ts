@@ -38,6 +38,21 @@ export type StoredFork = {
   workspacePath: string
   forkPointSha: string
   createdAt: string
+  /**
+   * The Context this Node's agent lives in, named at the moment of the Fork —
+   * which is also when the parent's understanding was copied into it, so it is
+   * findable even if nobody opens this Node's terminal until tomorrow.
+   */
+  sessionId?: string
+  /**
+   * The parent's Context, as it stood at that moment, when the understanding
+   * actually came across. Null when the parent had none to give — there is
+   * nothing to inherit from silence — and that is the plain answer to "did this
+   * Node start with a blank head", which nothing downstream then has to guess.
+   */
+  parentSessionId?: string | null
+  /** The one line written at Fork time: this Node's first instruction and its title. */
+  intent?: string | null
 }
 
 /**
@@ -82,6 +97,9 @@ export const forkRecord = (made: {
   home: string
   forkPointSha: string
   createdAt: string
+  sessionId?: string
+  parentSessionId?: string | null
+  intent?: string | null
 }): StoredFork => ({
   id: made.id,
   parentId: made.parentId,
@@ -89,6 +107,12 @@ export const forkRecord = (made: {
   workspacePath: workspaceOf(made.home, made.id),
   forkPointSha: made.forkPointSha,
   createdAt: made.createdAt,
+  sessionId: made.sessionId,
+  // Written as `null` rather than left out, because "this Node started with a
+  // blank head" and "nobody has said" are different answers and a reader must
+  // not have to tell them apart. `asFork` reads an absent one back the same way.
+  parentSessionId: made.parentSessionId ?? null,
+  intent: made.intent ?? null,
 })
 
 const isForkId = (value: unknown): value is string =>
@@ -97,10 +121,17 @@ const isForkId = (value: unknown): value is string =>
 const asFork = (candidate: unknown, home: string): StoredFork | null => {
   if (typeof candidate !== 'object' || candidate === null) return null
 
-  const { id, parentId, branch, workspacePath, forkPointSha, createdAt } = candidate as Record<
-    string,
-    unknown
-  >
+  const {
+    id,
+    parentId,
+    branch,
+    workspacePath,
+    forkPointSha,
+    createdAt,
+    sessionId,
+    parentSessionId,
+    intent,
+  } = candidate as Record<string, unknown>
 
   if (!isForkId(id)) return null
   if (parentId !== TRUNK_ID && !isForkId(parentId)) return null
@@ -111,7 +142,17 @@ const asFork = (candidate: unknown, home: string): StoredFork | null => {
 
   // Rebuilt field by field rather than passed through, so nothing that happens
   // to be sitting in the json travels on with it.
-  return { id, parentId, branch, workspacePath, forkPointSha, createdAt }
+  return {
+    id,
+    parentId,
+    branch,
+    workspacePath,
+    forkPointSha,
+    createdAt,
+    sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+    parentSessionId: typeof parentSessionId === 'string' ? parentSessionId : null,
+    intent: typeof intent === 'string' ? intent : null,
+  }
 }
 
 /**

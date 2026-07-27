@@ -19,7 +19,7 @@ const render = (data: Partial<NodeData>) =>
         forkRefusal: null,
         ...data,
       }}
-      onFork={() => {}}
+      onFork={async () => null}
     />,
   )
 

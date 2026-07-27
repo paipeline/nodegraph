@@ -8,6 +8,7 @@ Decisions already made — do not relitigate:
 - [ADR-0002](docs/adr/0002-fork-captures-a-moment.md) — a Fork captures *this instant*, including uncommitted changes.
 - [ADR-0003](docs/adr/0003-localhost-is-not-a-trust-boundary.md) — localhost is not a trust boundary. Every state-changing endpoint takes this run's key *and* refuses a foreign Origin.
 - [ADR-0004](docs/adr/0004-reading-your-files-is-not-a-free-read.md) — a GET that goes and reads the user's own files takes the key too. Reads of nodegraph's own bookkeeping stay open so the page can load.
+- [ADR-0005](docs/adr/0005-nodegraph-forks-the-context-itself.md) — nodegraph copies the Context itself, at Fork time. `claude --resume` only ever looks in the directory it is run from, so it cannot do this for us. The price is a coupling to claude's on-disk layout, which must fail loudly.
 
 `.nodegraph/graph.json` lives in the user's repository, so it is **input, not memory**. Nothing comes out of it unchecked: `src/core/store.ts` is the one place that decides what a record nodegraph wrote looks like, and it builds the ones nodegraph writes as well as checking the ones it reads. A value that reached a process — git's argv, git's working directory — without passing through there is a bug, however harmless it looks.
 

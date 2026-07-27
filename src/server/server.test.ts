@@ -97,6 +97,9 @@ describe('the local server', () => {
             branch: 'main',
             workspacePath: repo,
             environment: 'ready',
+            // A Trunk was never Forked from anything, and with no agent
+            // running there is nothing in the way of Forking it.
+            title: null,
             forkRefusal: null,
           },
         },

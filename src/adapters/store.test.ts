@@ -1,20 +1,23 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { forkRecord, type StoredFork } from '../core/store.js'
-import { homeOf, readForks, recordFork } from './store.js'
+import { homeOf, readForks, readSessions, recordFork, recordSession } from './store.js'
 
 let repo: string
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
-const aFork = (overrides: Partial<StoredFork> = {}): StoredFork => ({
+// The name goes through `forkRecord` rather than over the top of it, so a
+// fixture with its own name still carries the branch and Workspace nodegraph
+// would have given that name — which is what makes it readable back.
+const aFork = ({ id = 'a1b2c3d4', ...overrides }: Partial<StoredFork> = {}): StoredFork => ({
   ...forkRecord({
-    id: 'a1b2c3d4',
+    id,
     parentId: 'trunk',
     home: homeOf(repo),
     forkPointSha: '0123456789abcdef0123456789abcdef01234567',
@@ -43,6 +46,26 @@ describe('the store of what only nodegraph knows', () => {
 
     await recordFork(repo, fork)
 
+    await expect(readForks(repo)).resolves.toEqual([fork])
+  })
+
+  it('remembers which Context a Node’s agent is living in, without disturbing the Forks', async () => {
+    const fork = aFork()
+    await recordFork(repo, fork)
+
+    await recordSession(repo, {
+      nodeId: 'trunk',
+      sessionId: '11111111-2222-3333-4444-555555555555',
+      startedAt: '2026-07-27T09:01:00.000Z',
+    })
+
+    await expect(readSessions(repo)).resolves.toEqual([
+      {
+        nodeId: 'trunk',
+        sessionId: '11111111-2222-3333-4444-555555555555',
+        startedAt: '2026-07-27T09:01:00.000Z',
+      },
+    ])
     await expect(readForks(repo)).resolves.toEqual([fork])
   })
 
@@ -123,5 +146,60 @@ describe('the store of what only nodegraph knows', () => {
     ) as unknown as { forks: unknown[] }
     expect(onDisk.forks).toContainEqual(unbelievable)
     await expect(readForks(repo)).resolves.toEqual([aFork()])
+  })
+})
+
+describe('two things written down at the same instant', () => {
+  it('keeps every Context, however many Nodes are opened together', async () => {
+    const nodeIds = ['n1', 'n2', 'n3', 'n4', 'n5']
+
+    await Promise.all(
+      nodeIds.map((nodeId) =>
+        recordSession(repo, {
+          nodeId,
+          sessionId: `${nodeId}-11111111-2222-3333-4444-555555555555`,
+          startedAt: '2026-07-27T09:00:00.000Z',
+        }),
+      ),
+    )
+
+    // Losing one here means that Node is re-cut from its parent next time the
+    // graph is opened, throwing away everything it had worked out.
+    expect((await readSessions(repo)).map((session) => session.nodeId).sort()).toEqual(nodeIds)
+  })
+
+  it('keeps every Fork, however many are taken together', async () => {
+    // Names of the shape nodegraph gives a Node, because `core/store` will not
+    // read back a record wearing any other — see `usableForks`.
+    const ids = ['f1a2b3c4', 'f2a2b3c4', 'f3a2b3c4', 'f4a2b3c4', 'f5a2b3c4']
+
+    await Promise.all(ids.map((id) => recordFork(repo, aFork({ id }))))
+
+    expect((await readForks(repo)).map((fork) => fork.id).sort()).toEqual(ids)
+  })
+
+  it('keeps a Fork and a Context written at the same instant, both of them', async () => {
+    await Promise.all([
+      recordFork(repo, aFork()),
+      recordSession(repo, {
+        nodeId: 'trunk',
+        sessionId: '11111111-2222-3333-4444-555555555555',
+        startedAt: '2026-07-27T09:00:00.000Z',
+      }),
+    ])
+
+    await expect(readForks(repo)).resolves.toHaveLength(1)
+    await expect(readSessions(repo)).resolves.toHaveLength(1)
+  })
+
+  it('carries on writing after one write fails, rather than wedging the store', async () => {
+    // A store file that cannot be written at all: the first write fails.
+    mkdirSync(join(repo, '.nodegraph', 'graph.json'), { recursive: true })
+    await expect(recordFork(repo, aFork())).rejects.toThrow()
+
+    rmSync(join(repo, '.nodegraph', 'graph.json'), { recursive: true })
+
+    await recordFork(repo, aFork({ id: 'af7e4a11' }))
+    await expect(readForks(repo)).resolves.toHaveLength(1)
   })
 })
