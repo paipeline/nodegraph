@@ -11,6 +11,7 @@ import {
 import '@xyflow/react/dist/style.css'
 import { useEffect } from 'react'
 import { mergeGraph } from '../../src/core/merge.js'
+import { Session } from './Session.js'
 
 export type NodeData = {
   label: string
@@ -61,28 +62,43 @@ export const App = () => {
     }
   }, [setNodes, setEdges])
 
+  // Picking a Node on the graph is the whole gesture for "talk to this agent".
+  const selected = nodes.find((node) => node.selected)
+
   return (
     <div className="app">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ maxZoom: 1 }}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background gap={24} size={1} />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+      <div className="app__graph">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ maxZoom: 1 }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background gap={24} size={1} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
 
-      {nodes.length <= 1 && (
-        <p className="banner">
-          This is your <strong>Trunk</strong>. Fork from it to try something without
-          touching it — and throw the fork away if it doesn&rsquo;t work out.
-        </p>
-      )}
+        {nodes.length <= 1 && (
+          <p className="banner">
+            This is your <strong>Trunk</strong>. Fork from it to try something without
+            touching it — and throw the fork away if it doesn&rsquo;t work out.
+          </p>
+        )}
+      </div>
+
+      <aside className="app__session">
+        {selected === undefined ? (
+          <p className="session__empty">Pick a Node to talk to its agent.</p>
+        ) : (
+          // Remounting per Node is deliberate: each Node gets its own terminal,
+          // and the one being left behind keeps running on the server.
+          <Session key={selected.id} nodeId={selected.id} label={selected.data.label} />
+        )}
+      </aside>
     </div>
   )
 }

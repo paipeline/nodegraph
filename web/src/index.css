@@ -21,9 +21,22 @@ body {
 }
 
 .app {
-  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 46vw);
   width: 100vw;
   height: 100vh;
+}
+
+.app__graph {
+  position: relative;
+  min-width: 0;
+}
+
+.app__session {
+  display: flex;
+  min-width: 0;
+  border-left: 1px solid var(--card-border);
+  background: var(--bg);
 }
 
 .react-flow__background {
@@ -91,6 +104,66 @@ body {
 .card:hover {
   border-color: #3c4658;
   cursor: grab;
+}
+
+.session {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.session__head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--card-border);
+}
+
+.session__label {
+  font-weight: 600;
+}
+
+.session__status {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #223047;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--trunk);
+  white-space: nowrap;
+}
+
+.session__status--exited,
+.session__status--error,
+.session__status--lost {
+  background: #3a2326;
+  color: #ef9a9a;
+}
+
+.session__path {
+  overflow: hidden;
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session__screen {
+  flex: 1;
+  min-height: 0;
+  padding: 8px 4px 8px 10px;
+}
+
+.session__empty {
+  margin: auto;
+  padding: 0 24px;
+  color: var(--muted);
+  text-align: center;
 }
 
 .react-flow__node.selected .card {

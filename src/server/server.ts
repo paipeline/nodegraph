@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from 'node:path'
 import { readWorld } from '../adapters/git.js'
 import { toFlowGraph } from '../core/flow.js'
 import { reconcile } from '../core/reconcile.js'
+import { attachSessions } from './session.js'
 
 export type RunningServer = {
   url: string
@@ -123,6 +124,8 @@ export const startServer = async (options: {
     })
   })
 
+  const sessions = attachSessions(server, options.repoPath)
+
   await new Promise<void>((resolve) => {
     server.listen(options.port ?? 0, '127.0.0.1', resolve)
   })
@@ -134,6 +137,7 @@ export const startServer = async (options: {
     url: `http://127.0.0.1:${port}`,
     close: () =>
       new Promise<void>((resolveClose, reject) => {
+        sessions.close()
         server.closeAllConnections()
         server.close((error) => (error ? reject(error) : resolveClose()))
       }),
