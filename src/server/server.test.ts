@@ -89,4 +89,45 @@ describe('the local server', () => {
       edges: [],
     })
   })
+
+  it('forks a Node, and the graph shows the child and the edge to it straight away', async () => {
+    const forked = await fetch(`${url}/api/fork`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parentId: 'trunk' }),
+    })
+
+    expect(forked.status).toBe(201)
+    const { node } = (await forked.json()) as { node: { id: string; forkPointSha: string } }
+    expect(node.forkPointSha).toBe(git(repo, 'rev-parse', 'HEAD'))
+
+    const graph = (await (await fetch(`${url}/api/graph`)).json()) as {
+      nodes: { id: string; data: { kind: string } }[]
+      edges: unknown[]
+    }
+
+    expect(graph.nodes.map((each) => each.id)).toEqual(['trunk', node.id])
+    expect(graph.nodes[1]?.data.kind).toBe('fork')
+    expect(graph.edges).toEqual([{ id: `trunk->${node.id}`, source: 'trunk', target: node.id }])
+  })
+
+  it('still knows where a Fork came from after nodegraph is shut down and started again', async () => {
+    const forked = await fetch(`${url}/api/fork`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ parentId: 'trunk' }),
+    })
+    const { node } = (await forked.json()) as { node: { id: string; forkPointSha: string } }
+
+    await stop?.()
+    const restarted = await startServer({ repoPath: repo, port: 0 })
+    stop = restarted.close
+
+    const body = (await (await fetch(`${restarted.url}/api/nodes`)).json()) as {
+      nodes: { id: string; parentId: string | null }[]
+    }
+
+    expect(body.nodes).toContainEqual(expect.objectContaining({ id: node.id, parentId: 'trunk' }))
+    expect(git(repo, 'log', '-1', '--format=%H')).toBe(node.forkPointSha)
+  })
 })

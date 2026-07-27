@@ -2,7 +2,9 @@ import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { extname, join, resolve, sep } from 'node:path'
+import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
+import { readForks } from '../adapters/store.js'
 import { toFlowGraph } from '../core/flow.js'
 import { reconcile } from '../core/reconcile.js'
 
@@ -82,6 +84,20 @@ const serveWeb = async (
   json(response, 404, { error: `No route for ${pathname}` })
 }
 
+const readBody = (request: IncomingMessage): Promise<string> =>
+  new Promise((resolve, reject) => {
+    let body = ''
+    request.on('data', (chunk: Buffer) => {
+      body += chunk.toString()
+    })
+    request.on('end', () => resolve(body))
+    request.on('error', reject)
+  })
+
+/** The Nodes as they stand right now: what git has, crossed with what we wrote down. */
+const currentNodes = async (repoPath: string) =>
+  reconcile(await readWorld(repoPath), await readForks(repoPath))
+
 const handle = async (
   options: { repoPath: string; webRoot?: string },
   request: IncomingMessage,
@@ -90,15 +106,25 @@ const handle = async (
   const { pathname } = new URL(request.url ?? '/', 'http://127.0.0.1')
 
   if (pathname === '/api/nodes') {
-    const nodes = reconcile(await readWorld(options.repoPath))
-    json(response, 200, { nodes })
+    json(response, 200, { nodes: await currentNodes(options.repoPath) })
     return
   }
 
   // Layout is a rule, not a rendering concern, so it stays here where it is
   // tested. The browser only draws what it is given.
   if (pathname === '/api/graph') {
-    json(response, 200, toFlowGraph(reconcile(await readWorld(options.repoPath))))
+    json(response, 200, toFlowGraph(await currentNodes(options.repoPath)))
+    return
+  }
+
+  if (pathname === '/api/fork' && request.method === 'POST') {
+    const { parentId } = JSON.parse(await readBody(request)) as { parentId?: string }
+    if (typeof parentId !== 'string') {
+      json(response, 400, { error: 'Which Node should this fork from?' })
+      return
+    }
+
+    json(response, 201, { node: await fork({ repoPath: options.repoPath, parentId }) })
     return
   }
 
