@@ -120,4 +120,20 @@ describe('carrying the key on a websocket handshake', () => {
     expect(keyFromProtocols('nodegraph')).toBe(null)
     expect(keyFromProtocols(null)).toBe(null)
   })
+
+  /**
+   * A subprotocol is one whole token, and the key is what that token *is* —
+   * never something found inside it. Read the prefix wherever it turns up and
+   * the key stops being one string and becomes a pattern: every token with
+   * `nodegraph.key.` somewhere in it now names a key, and what counts as the
+   * key is whatever happens to follow. That is a bigger set of accepted
+   * spellings than the page ever sends, which is the whole of what a door is
+   * for — and a caller who offers a token the page would never offer is, by
+   * that fact alone, not the page.
+   */
+  it('reads the key only from the token that is the key, never one that merely contains it', () => {
+    for (const offered of [`nodegraph, x${toKeyProtocol(KEY)}`, `nodegraph, ..${toKeyProtocol(KEY)}`]) {
+      expect(keyFromProtocols(offered)).toBe(null)
+    }
+  })
 })

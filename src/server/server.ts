@@ -14,6 +14,13 @@ import { attachSessions } from './session.js'
 export type RunningServer = {
   url: string
   /**
+   * The interface this is really bound to, as the socket reports it — not the
+   * one we asked for. Loopback keeps the agent off the network the user is
+   * sitting on, and that is a fact about the listening socket, so it is read
+   * back off the socket rather than assumed from the url.
+   */
+  address: string
+  /**
    * The key this run minted. The page gets it by being served it; anyone else
    * holding it — the test suite, say — got it from here. Never print it.
    */
@@ -206,10 +213,11 @@ export const startServer = async (options: {
   })
 
   const address = server.address()
-  const port = typeof address === 'object' && address !== null ? address.port : 0
+  const bound = typeof address === 'object' && address !== null ? address : { address: '', port: 0 }
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://127.0.0.1:${bound.port}`,
+    address: bound.address,
     key: gate.key,
     close: () =>
       new Promise<void>((resolveClose, reject) => {
