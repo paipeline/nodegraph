@@ -88,7 +88,21 @@ export const readDiff = async ({
 }: DiffRequest): Promise<DiffSummary> => {
   // Two dots, not three: the fork point against the working tree exactly as it
   // stands, so committed and uncommitted work count the same.
-  const numstat = await git(workspacePath, ['diff', '--numstat', '-z', forkPointSha, '--'])
+  //
+  // `--end-of-options` is what keeps this a read. The fork point comes off
+  // disk, and git reads a leading dash as an option wherever it appears — a
+  // fork point of `--output=…` would make `git diff` truncate that file and
+  // report nothing wrong. The separator says: whatever follows is a commit,
+  // even if it is spelled like an instruction. `--` closes the same door on
+  // the paths side.
+  const numstat = await git(workspacePath, [
+    'diff',
+    '--numstat',
+    '-z',
+    '--end-of-options',
+    forkPointSha,
+    '--',
+  ])
 
   return summarize([...parseNumstat(numstat), ...(await readAdded(workspacePath))])
 }

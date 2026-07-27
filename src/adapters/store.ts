@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { usableForks, type StoredFork } from '../core/store.js'
 
 /**
  * The one thing the world cannot tell us: who forked from whom, and from which
@@ -7,16 +8,14 @@ import { join } from 'node:path'
  * other Node's understanding — so it is written down at the moment it happens.
  *
  * A single JSON file under `.nodegraph/` in the repo being viewed. See CLAUDE.md.
+ *
+ * Getting a record back is a separate question from having written one: the
+ * file sits in the user's repository where anything can reach it, and what it
+ * says goes on to become git's arguments. Which records are believable is a
+ * rule, so it lives in `core/store`; this file only fetches the bytes.
  */
 
-export type StoredFork = {
-  id: string
-  parentId: string
-  branch: string
-  workspacePath: string
-  forkPointSha: string
-  createdAt: string
-}
+export type { StoredFork }
 
 const HOME = '.nodegraph'
 const FILE = 'graph.json'
@@ -43,7 +42,7 @@ export const readForks = async (repoPath: string): Promise<StoredFork[]> => {
     return []
   }
 
-  return (JSON.parse(raw) as { forks: StoredFork[] }).forks
+  return usableForks(JSON.parse(raw))
 }
 
 export const recordFork = async (repoPath: string, fork: StoredFork): Promise<void> => {

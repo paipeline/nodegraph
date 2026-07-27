@@ -29,6 +29,13 @@ export type ProvisionedWorkspace = {
   forkPointSha: string
 }
 
+/**
+ * Every variable this file hands git is followed by `--end-of-options`, so git
+ * reads it as the name it is and never as an option. The branch and the path
+ * are nodegraph's own today, but a Discard will read both back out of the store
+ * — a file in the user's repository — and the door has to be shut before it is
+ * walked through, not after.
+ */
 const git = async (cwd: string, args: string[]): Promise<string> => {
   const { stdout } = await run('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 })
   return stdout
@@ -65,7 +72,16 @@ export const provisionWorkspace = async ({
     .split('\0')
     .filter((path) => path !== '')
 
-  await git(from, ['worktree', 'add', '-q', '-b', branch, workspacePath, forkPointSha])
+  await git(from, [
+    'worktree',
+    'add',
+    '-q',
+    '-b',
+    branch,
+    '--end-of-options',
+    workspacePath,
+    forkPointSha,
+  ])
 
   // From here on the Workspace exists, so a failure has to undo it: a Fork that
   // did not finish must leave nothing behind at all.
@@ -98,6 +114,6 @@ export const removeWorkspace = async ({
   workspacePath: string
   branch: string
 }): Promise<void> => {
-  await git(from, ['worktree', 'remove', '--force', workspacePath])
-  await git(from, ['branch', '-D', branch])
+  await git(from, ['worktree', 'remove', '--force', '--end-of-options', workspacePath])
+  await git(from, ['branch', '-D', '--end-of-options', branch])
 }

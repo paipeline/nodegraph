@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -89,5 +89,32 @@ describe('what each Node has changed since it was forked', () => {
     const response = await diffs({ origin: 'https://evil.example' })
 
     expect(response.status).toBe(403)
+  })
+
+  // ADR-0003 leaves reads unlocked on purpose, which is only safe while a read
+  // really is one. This route takes no key and the page polls it every two
+  // seconds, so nothing it finds in the store may become an instruction to git.
+  it('changes nothing on disk, whatever the store on disk claims a fork point is', async () => {
+    await forkFrom('trunk')
+    const precious = join(repo, 'precious.txt')
+    writeFileSync(precious, 'IRREPLACEABLE\n')
+
+    const store = join(repo, '.nodegraph', 'graph.json')
+    const { forks } = JSON.parse(readFileSync(store, 'utf8')) as {
+      forks: Record<string, unknown>[]
+    }
+    writeFileSync(
+      store,
+      JSON.stringify({
+        forks: forks.map((each) => ({ ...each, forkPointSha: `--output=${precious}` })),
+      }),
+    )
+
+    const response = await diffs()
+    const body = await response.json()
+
+    expect(readFileSync(precious, 'utf8')).toBe('IRREPLACEABLE\n')
+    expect(response.status).toBe(200)
+    expect(body).toEqual({ diffs: [] })
   })
 })

@@ -1,5 +1,14 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -174,6 +183,80 @@ describe('the diff of a Node against its fork point', () => {
       insertions: 0,
       deletions: 0,
     })
+  })
+
+  // Measuring a Node reads a repository and does nothing else. git decides
+  // what is an option by looking at the first character, so a fork point that
+  // starts with a dash is an instruction unless it is spelled as one that
+  // cannot be: `--output=…` truncates whatever it names.
+  it('refuses a fork point that reads as an option, rather than obeying it', async () => {
+    const precious = join(repo, 'precious.txt')
+    writeFileSync(precious, 'IRREPLACEABLE\n')
+
+    await expect(
+      readDiff({ workspacePath: repo, forkPointSha: `--output=${precious}` }),
+    ).rejects.toThrow()
+
+    expect(readFileSync(precious, 'utf8')).toBe('IRREPLACEABLE\n')
+  })
+
+  it('creates nothing on disk for a fork point that names a file git does not have', async () => {
+    const conjured = join(repo, 'conjured.txt')
+
+    await expect(
+      readDiff({ workspacePath: repo, forkPointSha: `--output=${conjured}` }),
+    ).rejects.toThrow()
+
+    expect(existsSync(conjured)).toBe(false)
+  })
+})
+
+/**
+ * The store is a json file inside the repository being viewed, so what comes
+ * out of it is whatever is on disk — a hand-edit, a bad merge, or a graph.json
+ * committed to a repository somebody cloned. Its fields become git's argv.
+ */
+describe('a store that says something nodegraph never wrote', () => {
+  const rewriteStore = (forks: unknown[]): void => {
+    writeFileSync(join(repo, '.nodegraph', 'graph.json'), `${JSON.stringify({ forks }, null, 2)}\n`)
+  }
+
+  const storedForks = (): Record<string, unknown>[] =>
+    (
+      JSON.parse(readFileSync(join(repo, '.nodegraph', 'graph.json'), 'utf8')) as {
+        forks: Record<string, unknown>[]
+      }
+    ).forks
+
+  it('cannot make measuring a Node write over a file in the repository', async () => {
+    // A real Fork, so git really has the Workspace and the graph really draws it.
+    await fork({ repoPath: repo, parentId: TRUNK_ID })
+    const precious = join(repo, 'precious.txt')
+    writeFileSync(precious, 'IRREPLACEABLE\n')
+
+    rewriteStore(storedForks().map((each) => ({ ...each, forkPointSha: `--output=${precious}` })))
+    const measured = await readDiffs(repo)
+
+    expect(readFileSync(precious, 'utf8')).toBe('IRREPLACEABLE\n')
+    expect(measured).toEqual([])
+  })
+
+  // One record nobody should believe costs that Node its numbers, and nobody
+  // else's — the same as a Workspace somebody deleted by hand.
+  it('still measures the Nodes it does believe', async () => {
+    const doubted = await fork({ repoPath: repo, parentId: TRUNK_ID })
+    const believed = await fork({ repoPath: repo, parentId: TRUNK_ID })
+    writeFileSync(join(believed.workspacePath, 'a.txt'), 'one\ntwo\nthree\nfour\n')
+
+    rewriteStore(
+      storedForks().map((each) =>
+        each.id === doubted.id ? { ...each, forkPointSha: '--exit-code' } : each,
+      ),
+    )
+
+    await expect(readDiffs(repo)).resolves.toEqual([
+      { nodeId: believed.id, files: 1, insertions: 1, deletions: 0 },
+    ])
   })
 })
 
