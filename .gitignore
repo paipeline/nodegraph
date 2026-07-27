@@ -3,3 +3,4 @@ dist/
 .nodegraph/
 *.log
 .DS_Store
+dist-web/
