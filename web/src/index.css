@@ -87,3 +87,13 @@ body {
   border-color: #6b2b2b;
   color: #ef9a9a;
 }
+
+.card:hover {
+  border-color: #3c4658;
+  cursor: grab;
+}
+
+.react-flow__node.selected .card {
+  border-color: var(--trunk);
+  box-shadow: 0 0 0 1px var(--trunk), 0 8px 24px rgb(0 0 0 / 45%);
+}

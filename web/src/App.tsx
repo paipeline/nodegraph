@@ -2,12 +2,15 @@ import {
   Background,
   Controls,
   ReactFlow,
+  useEdgesState,
+  useNodesState,
   type Edge,
   type Node,
   type NodeProps,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
+import { mergeGraph } from '../../src/core/merge.js'
 
 export type NodeData = {
   label: string
@@ -16,14 +19,11 @@ export type NodeData = {
   workspacePath: string
 }
 
-type Graph = {
-  nodes: Node<NodeData>[]
-  edges: Edge[]
-}
+type GraphNode = Node<NodeData>
 
 const POLL_MS = 2000
 
-const NodeCard = ({ data }: NodeProps<Node<NodeData>>) => (
+const NodeCard = ({ data }: NodeProps<GraphNode>) => (
   <div className={`card card--${data.kind}`}>
     <span className="card__kind">{data.kind}</span>
     <span className="card__label">{data.label}</span>
@@ -36,24 +36,21 @@ const NodeCard = ({ data }: NodeProps<Node<NodeData>>) => (
 const nodeTypes = { nodegraph: NodeCard }
 
 export const App = () => {
-  const [graph, setGraph] = useState<Graph>({ nodes: [], edges: [] })
-  const [error, setError] = useState<string | null>(null)
+  const [nodes, setNodes, onNodesChange] = useNodesState<GraphNode>([])
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
   useEffect(() => {
     let cancelled = false
 
     const load = async () => {
-      try {
-        const response = await fetch('/api/graph')
-        if (!response.ok) throw new Error(`Server answered ${response.status}`)
-        const next = (await response.json()) as Graph
-        if (!cancelled) {
-          setGraph(next)
-          setError(null)
-        }
-      } catch (cause) {
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause))
-      }
+      const response = await fetch('/api/graph')
+      if (!response.ok) throw new Error(`Server answered ${response.status}`)
+      const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
+      if (cancelled) return
+
+      // The server says what exists; the browser keeps where it sits.
+      setNodes((current) => mergeGraph(current, incoming).nodes)
+      setEdges(incoming.edges)
     }
 
     void load()
@@ -62,13 +59,15 @@ export const App = () => {
       cancelled = true
       clearInterval(timer)
     }
-  }, [])
+  }, [setNodes, setEdges])
 
   return (
     <div className="app">
       <ReactFlow
-        nodes={graph.nodes}
-        edges={graph.edges}
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ maxZoom: 1 }}
@@ -78,9 +77,7 @@ export const App = () => {
         <Controls showInteractive={false} />
       </ReactFlow>
 
-      {error !== null && <p className="banner banner--error">{error}</p>}
-
-      {error === null && graph.nodes.length <= 1 && (
+      {nodes.length <= 1 && (
         <p className="banner">
           This is your <strong>Trunk</strong>. Fork from it to try something without
           touching it — and throw the fork away if it doesn&rsquo;t work out.
