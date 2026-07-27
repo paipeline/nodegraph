@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.nodegraph/
+*.log
+.DS_Store
