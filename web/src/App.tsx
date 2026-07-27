@@ -9,12 +9,12 @@ import {
   type NodeProps,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { useEffect } from 'react'
+import { createContext, useCallback, useContext, useEffect } from 'react'
 import { mergeGraph } from '../../src/core/merge.js'
 
 export type NodeData = {
   label: string
-  kind: 'trunk'
+  kind: 'trunk' | 'fork'
   branch: string | null
   workspacePath: string
 }
@@ -23,15 +23,25 @@ type GraphNode = Node<NodeData>
 
 const POLL_MS = 2000
 
-const NodeCard = ({ data }: NodeProps<GraphNode>) => (
-  <div className={`card card--${data.kind}`}>
-    <span className="card__kind">{data.kind}</span>
-    <span className="card__label">{data.label}</span>
-    <span className="card__path" title={data.workspacePath}>
-      {data.workspacePath}
-    </span>
-  </div>
-)
+/** Node cards are rendered by ReactFlow, so the Fork action reaches them here. */
+const ForkContext = createContext<(parentId: string) => void>(() => {})
+
+const NodeCard = ({ id, data }: NodeProps<GraphNode>) => {
+  const onFork = useContext(ForkContext)
+
+  return (
+    <div className={`card card--${data.kind}`}>
+      <span className="card__kind">{data.kind}</span>
+      <span className="card__label">{data.label}</span>
+      <span className="card__path" title={data.workspacePath}>
+        {data.workspacePath}
+      </span>
+      <button className="card__fork nodrag" type="button" onClick={() => onFork(id)}>
+        Fork
+      </button>
+    </div>
+  )
+}
 
 const nodeTypes = { nodegraph: NodeCard }
 
@@ -39,43 +49,54 @@ export const App = () => {
   const [nodes, setNodes, onNodesChange] = useNodesState<GraphNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
+  const load = useCallback(async () => {
+    const response = await fetch('/api/graph')
+    if (!response.ok) throw new Error(`Server answered ${response.status}`)
+    const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
+
+    // The server says what exists; the browser keeps where it sits.
+    setNodes((current) => mergeGraph(current, incoming).nodes)
+    setEdges(incoming.edges)
+  }, [setNodes, setEdges])
+
+  const onFork = useCallback(
+    (parentId: string) => {
+      void (async () => {
+        await fetch('/api/fork', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ parentId }),
+        })
+        // Don't make the user wait out a poll to see what they just did.
+        await load()
+      })()
+    },
+    [load],
+  )
+
   useEffect(() => {
-    let cancelled = false
-
-    const load = async () => {
-      const response = await fetch('/api/graph')
-      if (!response.ok) throw new Error(`Server answered ${response.status}`)
-      const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
-      if (cancelled) return
-
-      // The server says what exists; the browser keeps where it sits.
-      setNodes((current) => mergeGraph(current, incoming).nodes)
-      setEdges(incoming.edges)
-    }
-
     void load()
     const timer = setInterval(() => void load(), POLL_MS)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
-  }, [setNodes, setEdges])
+    return () => clearInterval(timer)
+  }, [load])
 
   return (
     <div className="app">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ maxZoom: 1 }}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background gap={24} size={1} />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+      <ForkContext.Provider value={onFork}>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ maxZoom: 1 }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background gap={24} size={1} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </ForkContext.Provider>
 
       {nodes.length <= 1 && (
         <p className="banner">

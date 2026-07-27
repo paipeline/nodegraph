@@ -19,15 +19,28 @@ export type WorldSnapshot = {
 
 export type NodeView = {
   id: string
-  kind: 'trunk'
+  kind: 'trunk' | 'fork'
   workspacePath: string
   branch: string | null
   parentId: string | null
 }
 
+/** What only nodegraph knows about a Node: where it came from, and from when. */
+export type RecordedFork = {
+  id: string
+  parentId: string
+  workspacePath: string
+  forkPointSha: string
+}
+
 export const TRUNK_ID = 'trunk'
 
-export const reconcile = (world: WorldSnapshot): NodeView[] => {
+/**
+ * The store says which Node came from which; the world says which of them still
+ * exist. A Fork we remember but git no longer has is not drawn — the graph is
+ * allowed to forget, never to lie.
+ */
+export const reconcile = (world: WorldSnapshot, forks: RecordedFork[]): NodeView[] => {
   const primary = world.worktrees.find((worktree) => worktree.isPrimary)
   if (!primary) return []
 
@@ -39,5 +52,19 @@ export const reconcile = (world: WorldSnapshot): NodeView[] => {
       branch: primary.branch,
       parentId: null,
     },
+    ...forks.flatMap((fork) => {
+      const worktree = world.worktrees.find((candidate) => candidate.path === fork.workspacePath)
+      if (worktree === undefined) return []
+
+      return [
+        {
+          id: fork.id,
+          kind: 'fork' as const,
+          workspacePath: worktree.path,
+          branch: worktree.branch,
+          parentId: fork.parentId,
+        },
+      ]
+    }),
   ]
 }
