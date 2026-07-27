@@ -1,6 +1,12 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { usableForks, type StoredFork } from '../core/store.js'
+import {
+  readStore as believe,
+  storePath,
+  type Store,
+  type StoredFork,
+  type StoredSession,
+} from '../core/store.js'
 
 /**
  * The one thing the world cannot tell us: who forked from whom, and from which
@@ -15,26 +21,9 @@ import { usableForks, type StoredFork } from '../core/store.js'
  * rule, so it lives in `core/store`; this file only fetches the bytes.
  */
 
-export type { StoredFork }
-
-/**
- * Which Context a Node's agent is living in, written down the moment it is
- * first started, so that the next nodegraph goes back to that conversation
- * rather than starting the Node over.
- *
- * It says the Context's *name*, never that claude has created it: an agent that
- * was opened and never spoken to leaves nothing on disk, and a Node that was
- * resumed on the strength of this record alone would die on the spot, every
- * time, for good. Existence is read off the disk — see `hasContext`.
- */
-export type StoredSession = {
-  nodeId: string
-  sessionId: string
-  startedAt: string
-}
+export type { Store, StoredFork, StoredSession }
 
 const HOME = '.nodegraph'
-const FILE = 'graph.json'
 
 export const homeOf = (repoPath: string): string => join(repoPath, HOME)
 
@@ -50,18 +39,31 @@ export const prepareHome = async (repoPath: string): Promise<string> => {
   return home
 }
 
-/**
- * Whatever is in the file, as json, or nothing.
- *
- * A store that will not parse is the badly-resolved merge `core/store` was
- * written for, so it is answered the same way a hostile record is: believe none
- * of it. Letting the parser throw would take the whole graph down — every Node
- * gone and a parser error in the body of every route — over a file whose only
- * job is to say which Node came from which.
- */
-const readDocument = async (repoPath: string): Promise<unknown> => {
+
+/** The bytes of the store, or null when there is no store yet. */
+const readRaw = async (repoPath: string): Promise<string | null> => {
   try {
-    return JSON.parse(await readFile(join(homeOf(repoPath), FILE), 'utf8'))
+    return await readFile(storePath(homeOf(repoPath)), 'utf8')
+  } catch {
+    // Not there is not the same as not readable. A repository before its first
+    // Fork has no store, and that is an ordinary, silent, writable state.
+    return null
+  }
+}
+
+/**
+ * Whatever is in the file as plain data, believable or not.
+ *
+ * Kept apart from `readStore` on purpose: what nodegraph *believes* is what
+ * every reader gets, and what is *written down* is what a change is appended
+ * to. Refusing to believe a record is not a licence to delete it — a record
+ * nodegraph did not write is still somebody's: a hand-edit, a half-resolved
+ * merge, a newer nodegraph writing a field this one has never heard of.
+ */
+const readDocument = (raw: string | null): unknown => {
+  if (raw === null) return undefined
+  try {
+    return JSON.parse(raw)
   } catch {
     return undefined
   }
@@ -74,6 +76,12 @@ const writtenList = (document: unknown, part: 'forks' | 'sessions'): unknown[] =
   return Array.isArray(value) ? value : []
 }
 
+/** Everything else the file said, kept so an upgrade never eats a user's graph. */
+const alongside = (document: unknown): Record<string, unknown> =>
+  typeof document === 'object' && document !== null
+    ? { ...(document as Record<string, unknown>) }
+    : {}
+
 /**
  * Written beside the real file and then moved onto it, so a nodegraph that dies
  * mid-write leaves the previous graph intact rather than half a graph. There is
@@ -81,7 +89,7 @@ const writtenList = (document: unknown, part: 'forks' | 'sessions'): unknown[] =
  */
 const writeDocument = async (repoPath: string, document: unknown): Promise<void> => {
   const home = await prepareHome(repoPath)
-  const settled = join(home, FILE)
+  const settled = storePath(home)
   const pending = `${settled}.${process.pid}.writing`
 
   try {
@@ -94,7 +102,20 @@ const writeDocument = async (repoPath: string, document: unknown): Promise<void>
 }
 
 /**
- * Every change to the graph, one at a time.
+ * Thrown when something would have been written to a store nodegraph cannot
+ * read. Carries the sentence the user is shown, so the refusal that stops the
+ * write and the refusal on the Node's card are the same words.
+ */
+export class StoreCannotBeRead extends Error {
+  constructor(refusal: string) {
+    super(refusal)
+    this.name = 'StoreCannotBeRead'
+  }
+}
+
+/**
+ * Every change to the graph, one at a time — and never over a store nodegraph
+ * cannot read.
  *
  * Recording anything is a read, then a change, then a write; two of those
  * overlapping means the second one writes a graph that never saw the first, and
@@ -103,11 +124,11 @@ const writeDocument = async (repoPath: string, document: unknown): Promise<void>
  * do, so the queue lives at the one place every change has to pass through
  * rather than at each caller.
  *
- * The change is applied to the *document* rather than to what nodegraph
- * believes of it. Refusing to believe a record is not a licence to delete it:
- * a record nodegraph did not write is still somebody's — a hand-edit, a
- * half-resolved merge, a newer nodegraph writing a field this one has never
- * heard of. It stays on disk and stays unbelieved.
+ * The readability check lives here for the same reason. A store that will not
+ * parse reads as no Forks; appending to no Forks writes a file with only the
+ * new record in it, and every earlier Node's parentage goes with it. So the one
+ * place that writes is the one place that refuses, rather than each caller
+ * remembering to ask.
  */
 const changing = new Map<string, Promise<void>>()
 
@@ -116,7 +137,13 @@ const change = async (repoPath: string, apply: (document: unknown) => unknown): 
   const queue = changing.get(key) ?? Promise.resolve()
 
   const done = queue.then(async () => {
-    await writeDocument(repoPath, apply(await readDocument(repoPath)))
+    // Read inside the queued turn, so the refusal is decided against the file
+    // as it stands at the moment of writing rather than some earlier moment.
+    const raw = await readRaw(repoPath)
+    const { refusal } = believe(raw, homeOf(repoPath))
+    if (refusal !== null) throw new StoreCannotBeRead(refusal)
+
+    await writeDocument(repoPath, apply(readDocument(raw)))
   })
 
   // The queue must survive a change that failed, or one unwritable moment would
@@ -133,15 +160,15 @@ const change = async (repoPath: string, apply: (document: unknown) => unknown): 
   return done
 }
 
-/** Everything else the file said, kept so an upgrade never eats a user's graph. */
-const alongside = (document: unknown): Record<string, unknown> =>
-  typeof document === 'object' && document !== null ? { ...(document as Record<string, unknown>) } : {}
+/** Everything nodegraph wrote down and still believes, plus why, if it cannot. */
+export const readStore = async (repoPath: string): Promise<Store> =>
+  believe(await readRaw(repoPath), homeOf(repoPath))
 
 export const readForks = async (repoPath: string): Promise<StoredFork[]> =>
-  usableForks(await readDocument(repoPath), homeOf(repoPath))
+  (await readStore(repoPath)).forks
 
 export const readSessions = async (repoPath: string): Promise<StoredSession[]> =>
-  writtenList(await readDocument(repoPath), 'sessions') as StoredSession[]
+  (await readStore(repoPath)).sessions
 
 export const recordFork = async (repoPath: string, fork: StoredFork): Promise<void> =>
   change(repoPath, (document) => ({

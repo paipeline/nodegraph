@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { forkRecord, type StoredFork } from '../core/store.js'
-import { homeOf, readForks, readSessions, recordFork, recordSession } from './store.js'
+import { homeOf, readForks, readSessions, readStore, recordFork, recordSession } from './store.js'
 
 let repo: string
 
@@ -130,6 +130,50 @@ describe('the store of what only nodegraph knows', () => {
   })
 
   /**
+   * …and reading none of it is still not a licence to replace it. Everything
+   * that file holds — which Node came from which, and from which commit — is
+   * the one thing git can never tell us again, while the Workspaces and the
+   * branches stay on disk as orphans nothing can reach. Refusing to start is
+   * recoverable in a text editor; a rewrite is not recoverable at all.
+   */
+  it('refuses to write over a store it cannot read, and leaves it byte for byte', async () => {
+    for (const damaged of [
+      '',
+      '{"forks": [',
+      '<<<<<<< HEAD\n{"forks": []}\n=======\n{"forks": []}\n>>>>>>> theirs\n',
+    ]) {
+      await mkdir(homeOf(repo), { recursive: true })
+      const path = join(homeOf(repo), 'graph.json')
+      writeFileSync(path, damaged)
+
+      await expect(recordFork(repo, aFork())).rejects.toThrow(/graph\.json/)
+      await expect(
+        recordSession(repo, {
+          nodeId: 'trunk',
+          sessionId: '11111111-2222-3333-4444-555555555555',
+          startedAt: '2026-07-27T09:01:00.000Z',
+        }),
+      ).rejects.toThrow(/graph\.json/)
+
+      expect(readFileSync(path, 'utf8')).toBe(damaged)
+    }
+  })
+
+  it('says a store it cannot read cannot be read, rather than saying it is empty', async () => {
+    await mkdir(homeOf(repo), { recursive: true })
+    writeFileSync(join(homeOf(repo), 'graph.json'), '{"forks": [')
+
+    const store = await readStore(repo)
+
+    expect(store.refusal).toContain('graph.json')
+    expect(store.forks).toEqual([])
+  })
+
+  it('says nothing is wrong with a store that is simply not there yet', async () => {
+    await expect(readStore(repo)).resolves.toEqual({ forks: [], sessions: [], refusal: null })
+  })
+
+  /**
    * Refusing to believe a record is not the same as being allowed to destroy
    * it. The next Fork rewrites this file, and a record nodegraph did not write
    * is still somebody's — a hand-edit, a half-resolved merge, a newer nodegraph
@@ -151,13 +195,15 @@ describe('the store of what only nodegraph knows', () => {
 
 describe('two things written down at the same instant', () => {
   it('keeps every Context, however many Nodes are opened together', async () => {
-    const nodeIds = ['n1', 'n2', 'n3', 'n4', 'n5']
+    // Names of the shape nodegraph gives a Node and a Context: `core/store`
+    // will not read back a record wearing any other, and will not write one.
+    const nodeIds = ['a1a2b3c4', 'a2a2b3c4', 'a3a2b3c4', 'a4a2b3c4', 'a5a2b3c4']
 
     await Promise.all(
-      nodeIds.map((nodeId) =>
+      nodeIds.map((nodeId, index) =>
         recordSession(repo, {
           nodeId,
-          sessionId: `${nodeId}-11111111-2222-3333-4444-555555555555`,
+          sessionId: `1111111${index}-2222-3333-4444-555555555555`,
           startedAt: '2026-07-27T09:00:00.000Z',
         }),
       ),

@@ -6,6 +6,7 @@ import {
   type AgentActivity,
   type NodeContext,
 } from '../core/session.js'
+import { sessionRecord } from '../core/store.js'
 import { hasContext } from './context.js'
 import { readForks, readSessions, recordSession } from './store.js'
 
@@ -154,11 +155,14 @@ export class SessionSupervisor {
       // nodegraph goes back to it rather than starting the Node over. It says
       // the Context's *name*, not that claude has created it — that is read off
       // the disk every time, in `#contextOf`.
-      await recordSession(this.#repoPath, {
-        nodeId,
-        sessionId: context.sessionId,
-        startedAt: new Date().toISOString(),
-      })
+      await recordSession(
+        this.#repoPath,
+        sessionRecord({
+          nodeId,
+          sessionId: context.sessionId,
+          startedAt: new Date().toISOString(),
+        }),
+      )
     } catch (cause) {
       this.#sessions.delete(nodeId)
       pty.kill()

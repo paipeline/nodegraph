@@ -6,7 +6,7 @@ import { readDiffs } from '../adapters/diff.js'
 import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
 import { SessionSupervisor } from '../adapters/session.js'
-import { readForks } from '../adapters/store.js'
+import { readStore, StoreCannotBeRead } from '../adapters/store.js'
 import { readWorkspaceReports } from '../adapters/workspace.js'
 import { toFlowGraph } from '../core/flow.js'
 import { KEY_META } from '../core/guard.js'
@@ -154,12 +154,19 @@ const readBody = (request: IncomingMessage): Promise<string> =>
  */
 const currentNodes = async (repoPath: string) => {
   const world = await readWorld(repoPath)
+  const { forks, refusal } = await readStore(repoPath)
+  const reports = await readWorkspaceReports(world.worktrees.map((worktree) => worktree.path))
 
-  return reconcile(
-    world,
-    await readForks(repoPath),
-    await readWorkspaceReports(world.worktrees.map((worktree) => worktree.path)),
-  )
+  const nodes = reconcile(world, forks, reports)
+
+  // A store nodegraph cannot read stops every Fork, so it is said on every
+  // Node. It goes in the seat the on-fork refusal already sits in — read on
+  // every poll, written on the card, disabling the button — because that is the
+  // one path in this codebase already proven to reach the user's eyes, and a
+  // refusal the user cannot see is a Fork button that appears to be broken.
+  if (refusal === null) return nodes
+
+  return nodes.map((node) => ({ ...node, forkRefusal: refusal }))
 }
 
 /**
@@ -168,10 +175,11 @@ const currentNodes = async (repoPath: string) => {
  * may be Forked right now — are made here, so the browser only renders them.
  */
 const currentGraph = async (repoPath: string, agents: SessionSupervisor) => {
-  const forks = await readForks(repoPath)
+  const { forks } = await readStore(repoPath)
   // The same Nodes `/api/nodes` serves, Workspace reports and all: a Node whose
-  // environment is still landing, or whose on-fork hook cannot be run, has to
-  // say so on the card the user is looking at, not only in a route nothing polls.
+  // environment is still landing, whose on-fork hook cannot be run, or whose
+  // store cannot be read has to say so on the card the user is looking at, not
+  // only in a route nothing polls.
   const nodes = await currentNodes(repoPath)
 
   return toFlowGraph(
@@ -248,9 +256,17 @@ const handle = async (
       return
     }
 
-    json(response, 201, {
-      node: await fork({ repoPath: options.repoPath, parentId, intent: reading.intent }),
-    })
+    try {
+      json(response, 201, {
+        node: await fork({ repoPath: options.repoPath, parentId, intent: reading.intent }),
+      })
+    } catch (cause) {
+      // Not a crash: nodegraph is refusing, on purpose, to write over the one
+      // file that says which Node came from which. Answered like the other
+      // refusals so the page prints the sentence instead of a stack trace.
+      if (!(cause instanceof StoreCannotBeRead)) throw cause
+      json(response, 409, { error: cause.message })
+    }
     return
   }
 

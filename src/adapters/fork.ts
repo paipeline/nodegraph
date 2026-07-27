@@ -4,13 +4,7 @@ import { reconcile } from '../core/reconcile.js'
 import { readIntent } from '../core/session.js'
 import { discardContext, inheritContext } from './context.js'
 import { readWorld } from './git.js'
-import {
-  prepareHome,
-  readForks,
-  readSessions,
-  recordFork,
-  type StoredFork,
-} from './store.js'
+import { prepareHome, readStore, recordFork, StoreCannotBeRead, type StoredFork } from './store.js'
 import { provisionWorkspace, removeWorkspace } from './workspace.js'
 
 /**
@@ -39,8 +33,15 @@ export const fork = async ({ repoPath, parentId, intent }: ForkRequest): Promise
   const reading = readIntent(intent)
   if ('refusal' in reading) throw new Error(reading.refusal)
 
+  // Asked before anything is built, because a Fork that cannot be written down
+  // is a Fork that must not happen: the Workspace would exist with no Node
+  // pointing at it, and the store — the only record of which Node came from
+  // which — must not be replaced to find that out. `recordFork` refuses too;
+  // this is the same refusal said early enough to cost nothing.
   const world = await readWorld(repoPath)
-  const forks = await readForks(repoPath)
+  const { forks, sessions, refusal } = await readStore(repoPath)
+  if (refusal !== null) throw new StoreCannotBeRead(refusal)
+
   const parent = reconcile(world, forks).find((node) => node.id === parentId)
   if (parent === undefined) throw new Error(`No Node ${parentId} to fork from`)
 
@@ -48,7 +49,6 @@ export const fork = async ({ repoPath, parentId, intent }: ForkRequest): Promise
   // the parent's agent is living in, or — for a Node nobody has opened yet —
   // the one nodegraph laid down for it when *it* was Forked. Without that
   // second case, forking twice in a row would hand the second child nothing.
-  const sessions = await readSessions(repoPath)
   const parentRecord = forks.find((fork) => fork.id === parentId)
   const parentSessionId =
     sessions.find((session) => session.nodeId === parentId)?.sessionId ??

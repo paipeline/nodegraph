@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -128,6 +128,41 @@ describe('the local server', () => {
       nodes: { id: string; data: { forkRefusal: string | null } }[]
     }
     expect(fixed.nodes.find((each) => each.id === 'trunk')?.data.forkRefusal).toBeNull()
+  })
+
+  /**
+   * A store nodegraph cannot read is the one place where carrying on quietly is
+   * the damage: it would read as "no Forks", and the next Fork would write a
+   * file holding only the new record, taking every earlier Node's parentage
+   * with it. So it stops, on the card, before the button — and the file the
+   * user has to repair is still exactly the file they have to repair.
+   */
+  it('will not Fork while it cannot read what it wrote down, and leaves the file alone', async () => {
+    const forked = await forkFrom('trunk')
+    expect(forked.status).toBe(201)
+
+    const store = join(repo, '.nodegraph', 'graph.json')
+    const damaged = `${readFileSync(store, 'utf8').slice(0, 40)}\n<<<<<<< HEAD\n`
+    writeFileSync(store, damaged)
+
+    // Said where the user is looking, on every Node, not only in a response
+    // body nobody reads — this is the same seat the on-fork refusal sits in.
+    const graph = (await (await fetch(`${url}/api/graph`)).json()) as {
+      nodes: { id: string; data: { forkRefusal: string | null } }[]
+    }
+    expect(graph.nodes.length).toBeGreaterThan(0)
+    for (const node of graph.nodes) {
+      expect(node.data.forkRefusal).toContain('graph.json')
+    }
+
+    const refused = await forkFrom('trunk')
+    expect(refused.status).toBeGreaterThanOrEqual(400)
+    await expect(refused.json()).resolves.toMatchObject({
+      error: expect.stringContaining('graph.json') as unknown as string,
+    })
+
+    // Byte for byte: repairing the json in an editor must bring every Node back.
+    expect(readFileSync(store, 'utf8')).toBe(damaged)
   })
 
   it('forks a Node, and the graph shows the child and the edge to it straight away', async () => {
