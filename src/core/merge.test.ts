@@ -6,7 +6,14 @@ const node = (id: string, over: Partial<FlowNode> = {}): FlowNode => ({
   id,
   type: 'nodegraph',
   position: { x: 0, y: 0 },
-  data: { label: id, kind: 'trunk', branch: id, workspacePath: `/repo/${id}` },
+  data: {
+    label: id,
+    kind: 'trunk',
+    branch: id,
+    workspacePath: `/repo/${id}`,
+    environment: 'ready',
+    forkRefusal: null,
+  },
   ...over,
 })
 
@@ -26,7 +33,18 @@ describe('mergeGraph', () => {
 
     const merged = mergeGraph(
       onScreen,
-      graph([node('trunk', { data: { label: 'renamed', kind: 'trunk', branch: 'renamed', workspacePath: '/repo/trunk' } })]),
+      graph([
+        node('trunk', {
+          data: {
+            label: 'renamed',
+            kind: 'trunk',
+            branch: 'renamed',
+            workspacePath: '/repo/trunk',
+            environment: 'ready',
+            forkRefusal: null,
+          },
+        }),
+      ]),
     )
 
     expect(merged.nodes[0]?.data.label).toBe('renamed')

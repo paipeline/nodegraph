@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fork } from '../adapters/fork.js'
 import { readWorld } from '../adapters/git.js'
 import { readForks } from '../adapters/store.js'
+import { readWorkspaceReports } from '../adapters/workspace.js'
 import { toFlowGraph } from '../core/flow.js'
 import { KEY_META } from '../core/guard.js'
 import { reconcile } from '../core/reconcile.js'
@@ -141,9 +142,22 @@ const readBody = (request: IncomingMessage): Promise<string> =>
     request.on('error', reject)
   })
 
-/** The Nodes as they stand right now: what git has, crossed with what we wrote down. */
-const currentNodes = async (repoPath: string) =>
-  reconcile(await readWorld(repoPath), await readForks(repoPath))
+/**
+ * The Nodes as they stand right now: what git has, crossed with what we wrote
+ * down, crossed with what each Workspace says about itself — whether its
+ * environment is still landing, and whether a Fork from it can start at all.
+ * Every Workspace is asked, the Trunk included: it never has an environment
+ * coming, but it is the Node most Forks are attempted from.
+ */
+const currentNodes = async (repoPath: string) => {
+  const world = await readWorld(repoPath)
+
+  return reconcile(
+    world,
+    await readForks(repoPath),
+    await readWorkspaceReports(world.worktrees.map((worktree) => worktree.path)),
+  )
+}
 
 const handle = async (
   options: { repoPath: string; webRoot?: string; gate: Gate },

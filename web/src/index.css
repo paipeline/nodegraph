@@ -7,6 +7,7 @@
   --muted: #8b93a3;
   --trunk: #5b8dee;
   --fork: #8b6ce8;
+  --failed: #e8746c;
   color-scheme: dark;
 }
 
@@ -28,14 +29,23 @@ body {
   height: 100vh;
 }
 
+/*
+ * A grid item is `min-height: auto` by default, so anything inside it that
+ * measures itself — the terminal does — grows the row instead of scrolling in
+ * it. That pushed the whole graph column tens of thousands of pixels down the
+ * page the moment an agent was opened, taking every banner with it: a message
+ * that has scrolled out of the world is a message the user cannot read.
+ */
 .app__graph {
   position: relative;
   min-width: 0;
+  min-height: 0;
 }
 
 .app__session {
   display: flex;
   min-width: 0;
+  min-height: 0;
   border-left: 1px solid var(--card-border);
   background: var(--bg);
 }
@@ -105,11 +115,43 @@ body {
   white-space: nowrap;
 }
 
+.card__environment {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.card__environment--preparing {
+  color: var(--trunk);
+}
+
+.card__environment--failed {
+  color: var(--failed);
+}
+
+.card__refusal {
+  max-width: 260px;
+  font-size: 11px;
+  color: var(--failed);
+  /* The fix it names is a path, and a path has nowhere to break by itself. */
+  overflow-wrap: anywhere;
+}
+
+.card__fork:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.card__fork:disabled:hover {
+  border-color: var(--card-border);
+  color: var(--muted);
+}
+
 .banner {
   position: absolute;
   bottom: 16px;
   left: 16px;
   max-width: min(380px, calc(100% - 32px));
+  overflow-wrap: anywhere;
   margin: 0;
   padding: 10px 14px;
   border: 1px solid var(--card-border);
