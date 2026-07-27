@@ -1,8 +1,7 @@
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { promisify } from 'node:util'
 import {
   carriedAdditions,
   gitDirOf,
@@ -16,6 +15,7 @@ import {
   type EnvironmentStatus,
   type WorkspaceReport,
 } from '../core/environment.js'
+import { gitSpawn, runGit } from './git.js'
 import { homeOf } from './store.js'
 
 /**
@@ -25,8 +25,6 @@ import { homeOf } from './store.js'
  * Everything here is I/O — git, the filesystem, the project's own hook. The
  * rules about what any of it means live in `core/environment.ts`.
  */
-
-const run = promisify(execFile)
 
 export type ProvisionRequest = {
   /** The parent Node's Workspace — the state being forked from. */
@@ -49,17 +47,12 @@ export type ProvisionedWorkspace = {
   forkPointSha: string
 }
 
-const git = async (cwd: string, args: string[]): Promise<string> => {
-  const { stdout } = await run('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 })
-  return stdout
-}
-
 const zeroSeparated = (stdout: string): string[] =>
   stdout.split('\0').filter((entry) => entry !== '')
 
 /** Every worktree of this repository, as absolute paths. */
 const worktreePaths = async (from: string): Promise<string[]> =>
-  (await git(from, ['worktree', 'list', '--porcelain']))
+  (await runGit(from, ['worktree', 'list', '--porcelain']))
     .split('\n')
     .filter((line) => line.startsWith('worktree '))
     .map((line) => resolve(line.slice('worktree '.length)))
@@ -74,7 +67,7 @@ const readIgnoredEntries = async (from: string): Promise<Environment> =>
   splitEnvironment({
     from,
     entries: zeroSeparated(
-      await git(from, [
+      await runGit(from, [
         'ls-files',
         '--others',
         '--ignored',
@@ -105,7 +98,7 @@ const markerPath = async (workspacePath: string): Promise<string> => {
   // — and git is asked properly.
   const link = await readFile(join(workspacePath, '.git'), 'utf8').catch(() => undefined)
   const gitDir = link === undefined ? undefined : gitDirOf(workspacePath, link)
-  const asked = gitDir ?? (await git(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim()
+  const asked = gitDir ?? (await runGit(workspacePath, ['rev-parse', '--absolute-git-dir'])).trim()
 
   return join(asked, MARKER)
 }
@@ -271,9 +264,17 @@ const copyInto = async (from: string, workspacePath: string, relativePath: strin
   await cp(join(from, relativePath), destination, { recursive: true, verbatimSymlinks: true })
 }
 
+/**
+ * Every variable this file hands git is preceded by `--end-of-options`, so git
+ * reads it as the name it is and never as an option. The branch and the path
+ * are nodegraph's own today, but a Discard will read both back out of the store
+ * — a file in the user's repository — and the door has to be shut before it is
+ * walked through, not after.
+ */
 const applyPatch = (cwd: string, patch: string): Promise<void> =>
   new Promise((resolve, reject) => {
-    const applying = spawn('git', ['apply', '--binary', '-'], { cwd })
+    const hardened = gitSpawn(['apply', '--binary', '-'])
+    const applying = spawn('git', hardened.args, { cwd, env: hardened.env })
     let stderr = ''
 
     applying.stderr.on('data', (chunk: Buffer) => {
@@ -393,16 +394,16 @@ export const provisionWorkspace = async ({
   workspacePath,
   branch,
 }: ProvisionRequest): Promise<ProvisionedWorkspace> => {
-  const forkPointSha = (await git(from, ['rev-parse', 'HEAD'])).trim()
+  const forkPointSha = (await runGit(from, ['rev-parse', 'HEAD'])).trim()
 
   // Read the parent's uncommitted state *before* the child exists, so what the
   // child receives is the parent as it was at the instant Fork was pressed.
   // The patch covers every tracked change — edits, deletions and renames — and
   // the untracked list covers everything the parent has added since.
-  const patch = await git(from, ['diff', 'HEAD', '--binary'])
+  const patch = await runGit(from, ['diff', 'HEAD', '--binary'])
   const added = carriedAdditions({
     from,
-    entries: zeroSeparated(await git(from, ['ls-files', '--others', '--exclude-standard', '-z'])),
+    entries: zeroSeparated(await runGit(from, ['ls-files', '--others', '--exclude-standard', '-z'])),
     worktrees: await worktreePaths(from),
   })
   // Asked before the Workspace exists: a hook that cannot be run stops the Fork
@@ -410,10 +411,23 @@ export const provisionWorkspace = async ({
   const hook = await onForkHook(from)
   const ignored = hook === undefined ? await readIgnoredEntries(from) : NO_ENVIRONMENT
 
-  await git(from, ['worktree', 'add', '-q', '-b', branch, workspacePath, forkPointSha])
+  // Two commands, not `worktree add -b`, because `-b` is the one argument git
+  // reads twice: it takes the value and hands it on to be parsed as `git
+  // branch`'s own arguments, so a branch named `-m` renames the repository's
+  // branch out from under it and `-d` tries to delete one. A separator after
+  // `-b` is already too late. Made as a branch first, on its own, git will only
+  // read the name as a name — and says so instead of doing it.
+  await runGit(from, ['branch', '--end-of-options', branch, forkPointSha])
 
-  // From here on the Workspace exists, so a failure has to undo it: a Fork that
+  // From here on the branch exists, so a failure has to undo it: a Fork that
   // did not finish must leave nothing behind at all.
+  try {
+    await runGit(from, ['worktree', 'add', '-q', '--end-of-options', workspacePath, branch])
+  } catch (cause) {
+    await runGit(from, ['branch', '-D', '--end-of-options', branch])
+    throw cause
+  }
+
   try {
     if (patch !== '') await applyPatch(workspacePath, patch)
 
@@ -474,6 +488,6 @@ export const removeWorkspace = async ({
   await whenEnvironmentSettles(workspacePath)
   preparing.delete(workspacePath)
 
-  await git(from, ['worktree', 'remove', '--force', workspacePath])
-  await git(from, ['branch', '-D', branch])
+  await runGit(from, ['worktree', 'remove', '--force', '--end-of-options', workspacePath])
+  await runGit(from, ['branch', '-D', '--end-of-options', branch])
 }

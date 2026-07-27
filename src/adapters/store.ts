@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { usableForks, type StoredFork } from '../core/store.js'
 
 /**
  * The one thing the world cannot tell us: who forked from whom, and from which
@@ -7,16 +8,14 @@ import { join } from 'node:path'
  * other Node's understanding — so it is written down at the moment it happens.
  *
  * A single JSON file under `.nodegraph/` in the repo being viewed. See CLAUDE.md.
+ *
+ * Getting a record back is a separate question from having written one: the
+ * file sits in the user's repository where anything can reach it, and what it
+ * says goes on to become git's arguments. Which records are believable is a
+ * rule, so it lives in `core/store`; this file only fetches the bytes.
  */
 
-export type StoredFork = {
-  id: string
-  parentId: string
-  branch: string
-  workspacePath: string
-  forkPointSha: string
-  createdAt: string
-}
+export type { StoredFork }
 
 const HOME = '.nodegraph'
 const FILE = 'graph.json'
@@ -35,19 +34,40 @@ export const prepareHome = async (repoPath: string): Promise<string> => {
   return home
 }
 
-export const readForks = async (repoPath: string): Promise<StoredFork[]> => {
-  let raw: string
+/**
+ * Whatever is in the file, as json, or nothing.
+ *
+ * A store that will not parse is the badly-resolved merge `core/store` was
+ * written for, so it is answered the same way a hostile record is: believe none
+ * of it. Letting the parser throw would take the whole graph down — every Node
+ * gone and a parser error in the body of every route — over a file whose only
+ * job is to say which Node came from which.
+ */
+const readDocument = async (repoPath: string): Promise<unknown> => {
   try {
-    raw = await readFile(join(homeOf(repoPath), FILE), 'utf8')
+    return JSON.parse(await readFile(join(homeOf(repoPath), FILE), 'utf8'))
   } catch {
-    return []
+    return undefined
   }
+}
 
-  return (JSON.parse(raw) as { forks: StoredFork[] }).forks
+export const readForks = async (repoPath: string): Promise<StoredFork[]> =>
+  usableForks(await readDocument(repoPath), homeOf(repoPath))
+
+/** The records already in the file, believable or not, in the order they sit in. */
+const written = (document: unknown): unknown[] => {
+  if (typeof document !== 'object' || document === null) return []
+  const { forks } = document as { forks?: unknown }
+  return Array.isArray(forks) ? forks : []
 }
 
 export const recordFork = async (repoPath: string, fork: StoredFork): Promise<void> => {
-  const forks = [...(await readForks(repoPath)), fork]
+  // Appended to what is already written, not to what is already believed.
+  // Refusing to believe a record is not a licence to delete it: the next Fork
+  // rewrites this file, and a record nodegraph did not write is still
+  // somebody's — a hand-edit, a half-resolved merge, a newer nodegraph writing
+  // a field this one has never heard of. It stays on disk and stays unbelieved.
+  const forks = [...written(await readDocument(repoPath)), fork]
 
   const home = await prepareHome(repoPath)
   await writeFile(join(home, FILE), `${JSON.stringify({ forks }, null, 2)}\n`)

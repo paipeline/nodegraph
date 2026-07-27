@@ -16,6 +16,11 @@ export type Launch = {
  * We run the real `claude` TUI with no flags of our own. Every flag is a way
  * for the session to stop behaving like the one the user gets in their own
  * terminal, and fidelity is the whole point of using a pty.
+ *
+ * `node` is a Node the graph is showing, so its Workspace is a directory git
+ * itself named as a worktree of this repository — never a string off the store.
+ * There are no arguments at all, so the only thing here that could carry an
+ * instruction is that directory. See `core/store`.
  */
 export const toLaunch = (node: { workspacePath: string }): Launch => ({
   command: 'claude',

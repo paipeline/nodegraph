@@ -10,6 +10,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import type { DiffSummary } from '../../src/core/diff.js'
 import { KEY_HEADER } from '../../src/core/guard.js'
 import { mergeGraph } from '../../src/core/merge.js'
 import { describeProblem, describeUnreachable } from '../../src/core/problem.js'
@@ -52,15 +53,34 @@ export const App = () => {
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch('/api/graph')
+      // The graph itself is nodegraph's own bookkeeping and goes unlocked so the
+      // page can draw at all; the diffs are read out of the user's own files, so
+      // that poll carries this run's key. ADR-0004.
+      const [response, measured] = await Promise.all([
+        fetch('/api/graph'),
+        fetch('/api/diffs', { headers: { [KEY_HEADER]: runKey() } }),
+      ])
       if (!response.ok) {
         setProblem(await refusalIn(response))
         return
       }
       const incoming = (await response.json()) as { nodes: GraphNode[]; edges: Edge[] }
 
+      // A refused diff poll costs the numbers, not the graph — so say so, and
+      // still draw. Swallowing it would leave every card silently unmeasured.
+      if (!measured.ok) setProblem(await refusalIn(measured))
+      const { diffs } = measured.ok
+        ? ((await measured.json()) as { diffs: (DiffSummary & { nodeId: string })[] })
+        : { diffs: [] }
+      const byNode = new Map(diffs.map(({ nodeId, ...summary }) => [nodeId, summary]))
+
       // The server says what exists; the browser keeps where it sits.
-      setNodes((current) => mergeGraph(current, incoming).nodes)
+      setNodes((current) =>
+        mergeGraph(current, incoming).nodes.map((node) => ({
+          ...node,
+          data: { ...node.data, diff: byNode.get(node.id) },
+        })),
+      )
       setEdges(incoming.edges)
     } catch (cause) {
       setProblem(describeUnreachable(cause))

@@ -1,3 +1,5 @@
+import { describeDiff, type DiffSummary } from '../../src/core/diff.js'
+
 /**
  * One Node, as the user sees it.
  *
@@ -15,6 +17,8 @@ export type NodeData = {
   environment: 'preparing' | 'ready' | 'failed'
   /** Why a Fork from this Node would be refused, or null when it would not. */
   forkRefusal: string | null
+  /** What this Node changed since its fork point. The Trunk has no fork point. */
+  diff?: DiffSummary
 }
 
 /**
@@ -43,6 +47,7 @@ export const Card = ({ data, onFork }: { data: NodeData; onFork: () => void }) =
     <span className="card__path" title={data.workspacePath}>
       {data.workspacePath}
     </span>
+    {data.diff !== undefined && <span className="card__diff">{describeDiff(data.diff)}</span>}
     {ENVIRONMENT[data.environment] !== null && (
       <span className={`card__environment card__environment--${data.environment}`}>
         {ENVIRONMENT[data.environment]}

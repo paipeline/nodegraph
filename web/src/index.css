@@ -83,6 +83,12 @@ body {
   color: var(--fork);
 }
 
+.card__diff {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .card__fork {
   align-self: flex-start;
   margin-top: 6px;

@@ -29,6 +29,8 @@ export type Attempt = {
   /** A websocket upgrade is never a read, however it is spelled. */
   kind: 'websocket' | 'http'
   method: string
+  /** What is being asked for, with no query string — see ADR-0004. */
+  path: string
   /** The Origin header exactly as sent, or null when the caller sent none. */
   origin: string | null
   /** The key the caller presented, or null when it presented none. */
@@ -47,9 +49,29 @@ export type Verdict = { allowed: true } | { allowed: false; reason: string }
 /** Reads are left alone: locking them would only lock the user out of their own page. */
 const READ_METHODS = new Set(['GET', 'HEAD'])
 
-/** Changing something — or attaching to an agent — takes the key. */
+/**
+ * The reads that are not only reads. See ADR-0004.
+ *
+ * What the same-origin policy protects is the *answer*, not the work done to
+ * produce it — a `<script src>` or an `<img src>` from any page in the browser
+ * reaches a handler with no Origin header at all, and the handler runs whether
+ * or not the page that asked can read a word of what comes back. That is a fair
+ * trade for a route that only says what nodegraph already knows about itself.
+ * It is not a fair trade for one that walks the user's working tree, reads the
+ * contents of files git has never been told about, and starts a git in every
+ * Workspace to do it.
+ *
+ * Kept as whole paths rather than a prefix: a rule that matched by how a path
+ * begins would be a rule about spelling, and the next route to be added under
+ * a guarded prefix would inherit a lock nobody decided to give it.
+ */
+const READS_YOUR_FILES = new Set(['/api/diffs'])
+
+/** Changing something — reading the user's files — or attaching to an agent takes the key. */
 const needsKey = (attempt: Attempt): boolean =>
-  attempt.kind === 'websocket' || !READ_METHODS.has(attempt.method.toUpperCase())
+  attempt.kind === 'websocket' ||
+  !READ_METHODS.has(attempt.method.toUpperCase()) ||
+  READS_YOUR_FILES.has(attempt.path)
 
 /**
  * Compared to the end even once it is hopeless, so how long we take says
